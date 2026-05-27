@@ -1,0 +1,8 @@
+.DS_Store
+Thumbs.db
+node_modules/
+dist/
+.cache/
+*.log
+evkii-*-preview.png
+EVKII_SEO_LOVABLE_PLAN.md
