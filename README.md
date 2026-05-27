@@ -1,11 +1,12 @@
 # EVKII GitHub Pages site
 
-Design-forward static site for EVKII's operator-led AI marketing agency positioning.
+Design-forward static site for EVKII's operator-led AI marketing agency positioning and creative web design showcase.
 
 ## What is included
 
 - Homepage with CMO/operator-led positioning and standardized CTAs.
 - Services page with clear AI creative, UGC/video, website, paid growth, Amazon, CRM/Klaviyo and AI growth ops categories.
+- Work page with concept builds that demonstrate web design, funnel strategy, storefront design, lifecycle thinking and AI growth ops interfaces.
 - About page with founder credibility, quote and operating principles.
 - Contact page for growth call inquiries.
 - Unique metadata, canonical tags, Open Graph tags and JSON-LD schema.
@@ -14,10 +15,9 @@ Design-forward static site for EVKII's operator-led AI marketing agency position
 
 ## Publish on GitHub Pages
 
-1. Create a new GitHub repo under `evkiinc`, such as `evkiinc.github.io` or `EVKII.com`.
-2. Push these files to the repo.
-3. In GitHub, open Settings > Pages and publish from the `main` branch root.
-4. If moving the domain from Lovable to GitHub Pages, rename `CNAME.sample` to `CNAME` and confirm DNS points to GitHub Pages first.
+1. Push these files to `evkiinc/evkiinc.github.io`.
+2. GitHub Pages publishes from the `main` branch root.
+3. If moving the domain from Lovable to GitHub Pages later, rename `CNAME.sample` to `CNAME` and confirm DNS points to GitHub Pages first.
 
 ## Local preview
 

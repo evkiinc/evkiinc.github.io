@@ -9,6 +9,7 @@ EVKII is an operator-led AI marketing agency for DTC, eCommerce, supplement, CPG
 - **AI creative production:** ultra-real product scenes, paid social assets, ad concepts and testing matrices.
 - **UGC and shoppable video:** hooks, scripts, creator-style videos, product demos and video systems for ads and commerce.
 - **Websites and landing pages:** high-converting sites, product pages, lead-gen pages and campaign funnels.
+- **Creative web design systems:** concept-led sites, storefronts, landing pages, lifecycle surfaces and AI growth ops interfaces built to show how design supports revenue.
 - **Amazon growth:** storefronts, listing creative, A+ content direction and marketplace-ready brand systems.
 - **CRM and lifecycle:** Klaviyo flows, email/SMS campaigns, segmentation and retention systems.
 - **AI growth ops:** reporting, workflows, content operations and agentic systems for lean growth teams.
@@ -23,7 +24,8 @@ EVKII is led by Heath Squier, a founder-level CMO/CGO and growth operator. The a
 
 ## Links
 
-- Website: https://www.evkii.com/
+- Website: https://evkiinc.github.io/
 - Founder background: https://heathsquier.com/
-- Services: https://www.evkii.com/services/
-- Contact: https://www.evkii.com/contact/
+- Services: https://evkiinc.github.io/services/
+- Work showcase: https://evkiinc.github.io/work/
+- Contact: https://evkiinc.github.io/contact/
