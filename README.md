@@ -6,7 +6,7 @@ Design-forward static site for EVKII's operator-led AI marketing agency position
 
 - Homepage with CMO/operator-led positioning and standardized CTAs.
 - Services page with clear AI creative, UGC/video, website, paid growth, Amazon, CRM/Klaviyo and AI growth ops categories.
-- Work page with concept builds that demonstrate web design, funnel strategy, storefront design, lifecycle thinking and AI growth ops interfaces.
+- Work page with portfolio visuals from EVKII.com and HeathSquier.com that demonstrate web design, funnel strategy, storefront design, lifecycle thinking and AI growth ops interfaces.
 - About page with founder credibility, quote and operating principles.
 - Contact page for growth call inquiries.
 - Unique metadata, canonical tags, Open Graph tags and JSON-LD schema.
