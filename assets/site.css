@@ -397,7 +397,8 @@ p {
 
 .service-grid,
 .category-grid,
-.principles-grid {
+.principles-grid,
+.thesis-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1rem;
@@ -406,6 +407,7 @@ p {
 .service-card,
 .category-card,
 .principle-card,
+.thesis-card,
 .metric-card {
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -420,6 +422,24 @@ p {
   gap: 0.75rem;
 }
 
+.thesis-card {
+  min-height: 250px;
+  display: grid;
+  align-content: start;
+  gap: 0.9rem;
+  background:
+    linear-gradient(180deg, rgba(255, 0, 127, 0.09), rgba(255, 255, 255, 0.03) 42%, rgba(255, 255, 255, 0.02)),
+    rgba(255, 255, 255, 0.028);
+}
+
+.thesis-card::after {
+  content: "";
+  align-self: end;
+  width: 54px;
+  height: 2px;
+  background: var(--pink);
+}
+
 .index {
   color: var(--pink);
   font-size: 0.75rem;
@@ -429,6 +449,7 @@ p {
 }
 
 .service-card h3,
+.thesis-card h3,
 .category-card h2,
 .category-card h3,
 .principle-card h3,
@@ -439,6 +460,7 @@ p {
 }
 
 .service-card p,
+.thesis-card p,
 .category-card p,
 .principle-card p,
 .metric-card p {
@@ -597,10 +619,22 @@ p {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.compact-head {
+  margin-bottom: 1.2rem;
+}
+
+.service-process {
+  margin-bottom: 1rem;
+}
+
 .category-card {
   min-height: 270px;
   display: grid;
   gap: 0.85rem;
+}
+
+.category-card p strong {
+  color: var(--text);
 }
 
 .category-card ul,
@@ -761,6 +795,7 @@ p {
   }
 
   .service-grid,
+  .thesis-grid,
   .principles-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -805,6 +840,7 @@ p {
 
   .signal-row,
   .service-grid,
+  .thesis-grid,
   .category-grid,
   .principles-grid,
   .operator-list,
