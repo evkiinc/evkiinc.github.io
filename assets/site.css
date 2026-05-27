@@ -107,9 +107,9 @@ p {
 
 .brand img {
   display: block;
-  width: 122px;
-  max-height: 42px;
-  height: auto;
+  width: auto;
+  height: 48px;
+  max-width: 120px;
   object-fit: contain;
 }
 
@@ -780,8 +780,8 @@ p {
   }
 
   .brand img {
-    width: 104px;
-    max-height: 36px;
+    height: 42px;
+    max-width: 100px;
   }
 
   .hero h1,
