@@ -106,8 +106,11 @@ p {
 }
 
 .brand img {
-  width: 54px;
+  display: block;
+  width: 122px;
+  max-height: 42px;
   height: auto;
+  object-fit: contain;
 }
 
 .brand span {
@@ -774,6 +777,11 @@ p {
 
   .brand span {
     display: none;
+  }
+
+  .brand img {
+    width: 104px;
+    max-height: 36px;
   }
 
   .hero h1,
