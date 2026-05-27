@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://www.evkii.com/sitemap.xml
+Sitemap: https://evkiinc.github.io/sitemap.xml
