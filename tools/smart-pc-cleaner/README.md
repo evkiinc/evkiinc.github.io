@@ -81,6 +81,7 @@ Requires Windows 10 or 11 with the built-in PowerShell 5.1 (present on every mac
 ```
 smart-pc-cleaner/
 ├── SmartPCCleaner.ps1          # the whole app (Material-style GUI, 6 pages)
+├── SmartPCCleaner.ico          # designed app logo (desktop icon, window & taskbar)
 ├── Install-SmartPCCleaner.bat  # one-time: desktop icon + first launch
 └── README.md
 ```

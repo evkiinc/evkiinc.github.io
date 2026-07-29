@@ -194,8 +194,9 @@ function New-DesktopShortcut {
         $sc.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
         $sc.Arguments  = "-NoProfile -ExecutionPolicy Bypass -Sta -WindowStyle Hidden -File `"$PSCommandPath`""
         $sc.WorkingDirectory = Split-Path -Parent $PSCommandPath
-        $icon = "$env:SystemRoot\System32\cleanmgr.exe"
-        if (Test-Path -LiteralPath $icon) { $sc.IconLocation = "$icon,0" }
+        $customIcon = Join-Path (Split-Path -Parent $PSCommandPath) 'SmartPCCleaner.ico'
+        if (Test-Path -LiteralPath $customIcon) { $sc.IconLocation = "$customIcon,0" }
+        elseif (Test-Path -LiteralPath "$env:SystemRoot\System32\cleanmgr.exe") { $sc.IconLocation = "$env:SystemRoot\System32\cleanmgr.exe,0" }
         else { $sc.IconLocation = "$env:SystemRoot\System32\shell32.dll,21" }
         $sc.Description = 'Smart PC Cleaner - safe cleanup, AI-tool tidy-up, mover and performance care'
         $sc.Save()
@@ -1260,6 +1261,10 @@ $script:Form.MinimumSize = New-Object System.Drawing.Size(1080, 680)
 $script:Form.StartPosition = 'CenterScreen'
 $script:Form.Font = $script:FontBody
 $script:Form.BackColor = Get-Color 'Bg'
+try {
+    $icoPath = Join-Path (Split-Path -Parent $PSCommandPath) 'SmartPCCleaner.ico'
+    if (Test-Path -LiteralPath $icoPath) { $script:Form.Icon = New-Object System.Drawing.Icon($icoPath) }
+} catch { }
 
 # content host: a TabControl with its headers hidden (pages switched by the sidebar)
 $script:Tabs = New-Object System.Windows.Forms.TabControl
