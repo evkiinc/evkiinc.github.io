@@ -12,6 +12,17 @@ Optimization** page (see below).
 
 ## Quick start
 
+**Fastest — one line, no zip needed.** Open PowerShell (Start menu → type `powershell` → Enter) and paste:
+
+```powershell
+irm https://raw.githubusercontent.com/evkiinc/evkiinc.github.io/claude/pc-performance-cleaner-lsnfs6/tools/smart-pc-cleaner/Get-SmartPCCleaner.ps1 | iex
+```
+
+It downloads the app to `%LOCALAPPDATA%\Programs\SmartPCCleaner`, puts the logo icon on the
+desktop and opens the app. No admin rights needed to install.
+
+**Or manually:**
+
 1. Copy the `smart-pc-cleaner` folder anywhere on the PC (e.g. `C:\Tools\smart-pc-cleaner`).
 2. Double-click **`Install-SmartPCCleaner.bat`** once.
    It creates a **desktop icon** and opens the app.
@@ -82,6 +93,7 @@ Requires Windows 10 or 11 with the built-in PowerShell 5.1 (present on every mac
 smart-pc-cleaner/
 ├── SmartPCCleaner.ps1          # the whole app (Material-style GUI, 6 pages)
 ├── SmartPCCleaner.ico          # designed app logo (desktop icon, window & taskbar)
+├── Get-SmartPCCleaner.ps1      # one-line web installer (irm ... | iex)
 ├── Install-SmartPCCleaner.bat  # one-time: desktop icon + first launch
 └── README.md
 ```
