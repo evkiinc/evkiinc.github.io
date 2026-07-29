@@ -5,6 +5,11 @@ no dependencies, nothing phoned home. Built for machines that run AI coding agen
 (Claude Code, Codex, Cursor, Copilot) and have accumulated caches, session logs and large
 project folders that need cleaning up or moving to another drive.
 
+**v2.0** — crisp Google Material-style interface: left navigation sidebar, the four-color
+accent, flat blue/white buttons with hover states, hairline-bordered white cards, stat tiles
+on the dashboard, and a status bar narrating every step. Plus a full **Registry — Repair &
+Optimization** page (see below).
+
 ## Quick start
 
 1. Copy the `smart-pc-cleaner` folder anywhere on the PC (e.g. `C:\Tools\smart-pc-cleaner`).
@@ -25,7 +30,7 @@ Requires Windows 10 or 11 with the built-in PowerShell 5.1 (present on every mac
 | **System Cleanup** | Temp files, thumbnail/shader caches, crash dumps, error reports, browser caches, Windows Update leftovers, Recycle Bin | Scan first (read-only preview with sizes) → tick → confirm. Files in use or newer than each item's safety age are skipped |
 | **AI Tools** | Finds Claude Code, Claude Desktop, ChatGPT, Codex CLI, Cursor, VS Code, Copilot, npm/pip caches, Ollama/HuggingFace model stores | Three verdicts: **CLEAN** (safe caches, tickable) / **MOVE** (sessions & models — sent to the Mover, never deleted) / **KEEP** (configs & credentials — the UI refuses to select them) |
 | **Move to G:** | Finds large folders/files in Desktop, Documents, Downloads, Media folders (plus any folder you add), checks movability, lets you rename each item and organize into category or project folders on the target drive | Copy → verify (file count + bytes) → only then delete the original. Optional shortcut left behind. Every move logged to CSV. Windows/Program Files/AppData/installed apps/OneDrive placeholders/junctions are refused outright |
-| **Registry Care** | Removes only clearly-orphaned entries: App Paths pointing at missing programs, and non-MSI uninstall leftovers whose uninstaller *and* install folder are both gone. Also a privacy clear of recent-file lists | Every key exported to a `.reg` backup **before** deletion (restore by double-clicking the backup). One-click System Restore Point. MSI apps, drivers, services, file associations are never scanned or touched |
+| **Registry — Repair & Optimization** | **Repair:** five scanners for verifiably-dead entries — orphaned App Paths, non-MSI uninstall leftovers, broken startup (Run) entries, stale Explorer display-name cache (MuiCache), broken shared-DLL reference counts. **Optimization:** six documented, user-level responsiveness tweaks (snappier menus, no startup-app delay, no window/taskbar animations, Game DVR off, faster sign-out timeouts, local-only Start search) — each applied with its original values backed up and revertible in one click. Plus recent-file-list privacy clear, full HKCU\Software backup, and a hive-size report | Every key exported to a `.reg` backup **before** any change (restore by double-clicking the backup). One-click System Restore Point. MSI apps, drivers, services, file associations are never scanned or touched. No "registry defrag" — Windows compacts hives itself at boot, and the report says so |
 | **Performance** | Reversible startup manager, background memory trim, DNS flush, Explorer restart, power plans, and cleanup of leftover windowless agent helper processes (node/python/build servers whose parent exited) | Startup disables are stored, not deleted (one click to re-enable). Memory trim excludes system processes *and* all dev/agent tooling. Leftover processes are listed for review, never auto-killed |
 
 ## Design principles (why this won't damage Windows)
@@ -51,8 +56,10 @@ Requires Windows 10 or 11 with the built-in PowerShell 5.1 (present on every mac
 
 ## Undo / recovery
 
-- **Registry:** double-click the `.reg` file in the backup folder (button on the Registry tab),
-  or use the System Restore Point.
+- **Registry repairs:** double-click the `.reg` file in the backup folder (button on the
+  Registry page), or use the System Restore Point.
+- **Registry optimizations:** tick the tweak and click *Revert checked* — original values
+  are restored exactly from the stored backup.
 - **Startup entries:** select the disabled entry and click *Enable selected*.
 - **Moves:** the move history CSV records source → destination for every item; move it back with
   Explorer if needed (a shortcut at the old location points to the new one).
@@ -73,7 +80,7 @@ Requires Windows 10 or 11 with the built-in PowerShell 5.1 (present on every mac
 
 ```
 smart-pc-cleaner/
-├── SmartPCCleaner.ps1          # the whole app (GUI, ~6 tabs)
+├── SmartPCCleaner.ps1          # the whole app (Material-style GUI, 6 pages)
 ├── Install-SmartPCCleaner.bat  # one-time: desktop icon + first launch
 └── README.md
 ```

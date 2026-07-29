@@ -39,7 +39,7 @@ $ErrorActionPreference = 'Continue'
 #  App constants / folders
 # ============================================================================
 $script:AppName    = 'Smart PC Cleaner'
-$script:AppVersion = '1.0.0'
+$script:AppVersion = '2.0.0'
 $script:AppDir     = Join-Path $env:LOCALAPPDATA 'SmartPCCleaner'
 $script:LogDir     = Join-Path $script:AppDir 'logs'
 $script:BackupDir  = Join-Path $script:AppDir 'registry-backups'
@@ -677,22 +677,6 @@ function Get-OrphanedUninstallEntries {
     return $found
 }
 
-function Remove-RegistryKeySafe {
-    param([string]$KeyName)
-    $backup = Backup-RegistryKey -KeyName $KeyName
-    if (-not $backup) {
-        Write-Log ("SKIPPED registry delete (backup failed): {0}" -f $KeyName) 'WARN'
-        return @{ Success = $false; Message = 'Backup export failed - key NOT deleted' }
-    }
-    try {
-        $ps = ConvertTo-PSRegPath -KeyName $KeyName
-        Remove-Item -Path $ps -Recurse -Force -ErrorAction Stop
-        Write-Log ("Registry key removed (backup: {0}): {1}" -f (Split-Path -Leaf $backup), $KeyName)
-        return @{ Success = $true; Message = ('Removed (backup: {0})' -f (Split-Path -Leaf $backup)) }
-    } catch {
-        return @{ Success = $false; Message = $_.Exception.Message }
-    }
-}
 
 function Clear-ExplorerMRU {
     # Privacy/no-risk cleanup: recent-file lists. Backed up first; Windows recreates the keys.
@@ -881,51 +865,349 @@ function Get-OrphanAgentProcesses {
     return $rows
 }
 
+
 # ============================================================================
-#  GUI construction
+#  Registry repair (value-level) + optimization tweak engine
 # ============================================================================
-$script:Form = New-Object System.Windows.Forms.Form
-$script:Form.Text = "$($script:AppName) v$($script:AppVersion)" + $(if ($script:IsAdmin) { '  [Administrator]' } else { '  [Standard user - some features limited]' })
-$script:Form.Size = New-Object System.Drawing.Size(1180, 760)
-$script:Form.MinimumSize = New-Object System.Drawing.Size(980, 640)
-$script:Form.StartPosition = 'CenterScreen'
-$script:Form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-
-$script:Status = New-Object System.Windows.Forms.StatusStrip
-$script:StatusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
-$script:StatusLabel.Text = 'Ready. Everything is preview-first: nothing is changed until you confirm.'
-$null = $script:Status.Items.Add($script:StatusLabel)
-$script:Form.Controls.Add($script:Status)
-
-$script:Tabs = New-Object System.Windows.Forms.TabControl
-$script:Tabs.Dock = 'Fill'
-$script:Form.Controls.Add($script:Tabs)
-$script:Tabs.BringToFront()
-
-function Set-Status {
-    param([string]$Text)
-    $script:StatusLabel.Text = $Text
-    [System.Windows.Forms.Application]::DoEvents()
+function Remove-RegistryItemSafe {
+    # Removes a whole key, or a single value when $ValueName is given.
+    # The containing key is ALWAYS exported to a .reg backup first; no backup -> no delete.
+    param([string]$KeyName, [string]$ValueName = $null)
+    $backup = Backup-RegistryKey -KeyName $KeyName
+    if (-not $backup) {
+        Write-Log ("SKIPPED registry delete (backup failed): {0}" -f $KeyName) 'WARN'
+        return @{ Success = $false; Message = 'Backup export failed - nothing was deleted' }
+    }
+    try {
+        $ps = ConvertTo-PSRegPath -KeyName $KeyName
+        if ($ValueName) {
+            Remove-ItemProperty -Path $ps -Name $ValueName -Force -ErrorAction Stop
+            Write-Log ("Registry value removed (backup: {0}): {1} \ {2}" -f (Split-Path -Leaf $backup), $KeyName, $ValueName)
+        } else {
+            Remove-Item -Path $ps -Recurse -Force -ErrorAction Stop
+            Write-Log ("Registry key removed (backup: {0}): {1}" -f (Split-Path -Leaf $backup), $KeyName)
+        }
+        return @{ Success = $true; Message = ('Removed (backup: {0})' -f (Split-Path -Leaf $backup)) }
+    } catch {
+        return @{ Success = $false; Message = $_.Exception.Message }
+    }
 }
 
-function New-Btn {
-    param([string]$Text, [int]$X, [int]$Y, [int]$W = 170, [int]$H = 30, [scriptblock]$OnClick)
+function Get-BrokenRunEntries {
+    # Startup Run values whose command points at a program that no longer exists.
+    $found = @()
+    $roots = @(
+        @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Run';             Native='HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run' },
+        @{ Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run';             Native='HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' },
+        @{ Path='HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'; Native='HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run' }
+    )
+    foreach ($root in $roots) {
+        if (-not (Test-Path $root.Path)) { continue }
+        try {
+            $props = Get-ItemProperty -Path $root.Path -ErrorAction SilentlyContinue
+            if (-not $props) { continue }
+            foreach ($prop in @($props.PSObject.Properties)) {
+                if ($prop.Name -in @('PSPath','PSParentPath','PSChildName','PSDrive','PSProvider')) { continue }
+                $exe = Get-ExeFromCommand -Command ([string]$prop.Value)
+                if ($exe -and $exe -match '^[A-Za-z]:\\' -and -not (Test-Path -LiteralPath $exe)) {
+                    $found += [pscustomobject]@{
+                        Type='Broken startup entry'; KeyName=$root.Native; ValueName=$prop.Name
+                        Detail=("'{0}' starts a missing program: {1}" -f $prop.Name, $exe)
+                    }
+                }
+            }
+        } catch { }
+    }
+    return $found
+}
+
+function Get-StaleMuiCache {
+    # Explorer display-name cache entries for programs that no longer exist. Pure cache - Windows rebuilds it.
+    $found = @()
+    $psPath = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache'
+    $native = 'HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache'
+    if (-not (Test-Path $psPath)) { return $found }
+    try {
+        $props = Get-ItemProperty -Path $psPath -ErrorAction SilentlyContinue
+        if (-not $props) { return $found }
+        foreach ($prop in @($props.PSObject.Properties)) {
+            $n = [string]$prop.Name
+            if ($n -notmatch '^[A-Za-z]:\\') { continue }
+            $file = $n -replace '\.(FriendlyAppName|ApplicationCompany)$', ''
+            if (-not (Test-Path -LiteralPath $file)) {
+                $found += [pscustomobject]@{
+                    Type='Stale display-name cache'; KeyName=$native; ValueName=$n
+                    Detail=("Cached name for missing program: {0}" -f $file)
+                }
+            }
+        }
+    } catch { }
+    return $found
+}
+
+function Get-BrokenSharedDlls {
+    # SharedDLLs reference-count entries for library files that no longer exist (needs Admin to fix).
+    $found = @()
+    $psPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs'
+    $native = 'HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs'
+    if (-not (Test-Path $psPath)) { return $found }
+    try {
+        $props = Get-ItemProperty -Path $psPath -ErrorAction SilentlyContinue
+        if (-not $props) { return $found }
+        foreach ($prop in @($props.PSObject.Properties)) {
+            $n = [string]$prop.Name
+            if ($n -notmatch '^[A-Za-z]:\\') { continue }
+            $file = [Environment]::ExpandEnvironmentVariables($n)
+            if (-not (Test-Path -LiteralPath $file)) {
+                $found += [pscustomobject]@{
+                    Type='Broken shared-DLL count'; KeyName=$native; ValueName=$n
+                    Detail=("Reference count for missing library: {0}" -f $file)
+                }
+            }
+        }
+    } catch { }
+    return $found
+}
+
+# ----------------------------------------------------------------------------
+#  Optimization tweaks - every one is HKCU-only, reversible, and backed up
+# ----------------------------------------------------------------------------
+$script:TweakBackupKey = 'HKCU:\Software\SmartPCCleaner\TweakBackups'
+
+function Get-RegTweaks {
+    $t = @()
+    $t += [pscustomobject]@{ Key='SnappyMenus'; Name='Snappier menus'
+        Desc='Menus open after 150 ms instead of 400 ms. The classic no-downside responsiveness tweak.'
+        Sets=@(
+            @{ Path='HKCU:\Control Panel\Desktop'; Name='MenuShowDelay'; Type='String'; Value='150' }
+        ) }
+    $t += [pscustomobject]@{ Key='NoStartupDelay'; Name='Remove startup app delay'
+        Desc='Windows staggers startup apps by ~10 s after login; this starts them immediately.'
+        Sets=@(
+            @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize'; Name='StartupDelayInMSec'; Type='DWord'; Value=0 }
+        ) }
+    $t += [pscustomobject]@{ Key='NoAnimations'; Name='Disable window & taskbar animations'
+        Desc='Windows snap instantly instead of animating - the UI feels faster, especially on older GPUs. Takes effect after sign-out or Explorer restart.'
+        Sets=@(
+            @{ Path='HKCU:\Control Panel\Desktop\WindowMetrics'; Name='MinAnimate'; Type='String'; Value='0' },
+            @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; Name='TaskbarAnimations'; Type='DWord'; Value=0 }
+        ) }
+    $t += [pscustomobject]@{ Key='NoGameDVR'; Name='Disable Xbox Game DVR background recording'
+        Desc='Stops the always-on game capture buffer, freeing RAM/GPU. Game clips via Win+G stop working while disabled.'
+        Sets=@(
+            @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR'; Name='AppCaptureEnabled'; Type='DWord'; Value=0 },
+            @{ Path='HKCU:\System\GameConfigStore'; Name='GameDVR_Enabled'; Type='DWord'; Value=0 }
+        ) }
+    $t += [pscustomobject]@{ Key='FasterAppKill'; Name='Faster sign-out / shutdown timeouts'
+        Desc='Waits 5 s (not 20 s) for apps at sign-out. Caution: apps holding unsaved work get less time to object.'
+        Sets=@(
+            @{ Path='HKCU:\Control Panel\Desktop'; Name='WaitToKillAppTimeout'; Type='String'; Value='5000' },
+            @{ Path='HKCU:\Control Panel\Desktop'; Name='HungAppTimeout'; Type='String'; Value='4000' }
+        ) }
+    $t += [pscustomobject]@{ Key='NoWebSearch'; Name='Local-only Start menu search'
+        Desc='Stops Start-menu searches querying Bing - local search gets faster and quieter. Web results disappear from Start.'
+        Sets=@(
+            @{ Path='HKCU:\Software\Policies\Microsoft\Windows\Explorer'; Name='DisableSearchBoxSuggestions'; Type='DWord'; Value=1 }
+        ) }
+    return $t
+}
+
+function Get-TweakState {
+    param($Tweak)
+    if (Test-Path (Join-Path $script:TweakBackupKey $Tweak.Key)) { return 'Applied' }
+    $allMatch = $true
+    foreach ($s in $Tweak.Sets) {
+        $cur = $null
+        try {
+            if (Test-Path $s.Path) {
+                $p = Get-ItemProperty -Path $s.Path -Name $s.Name -ErrorAction SilentlyContinue
+                if ($p) { $cur = $p.($s.Name) }
+            }
+        } catch { }
+        if ([string]$cur -ne [string]$s.Value) { $allMatch = $false; break }
+    }
+    if ($allMatch) { return 'Already set' }
+    return 'Not applied'
+}
+
+function Invoke-TweakApply {
+    param($Tweak)
+    try {
+        $bk = Join-Path $script:TweakBackupKey $Tweak.Key
+        if (Test-Path $bk) { return @{ Success=$true; Message='Already applied' } }
+        $null = New-Item -Path $bk -Force -ErrorAction Stop
+        $i = 0
+        foreach ($s in $Tweak.Sets) {
+            $existed = 0; $orig = ''
+            try {
+                if (Test-Path $s.Path) {
+                    $p = Get-ItemProperty -Path $s.Path -Name $s.Name -ErrorAction SilentlyContinue
+                    if ($p) { $existed = 1; $orig = [string]$p.($s.Name) }
+                }
+            } catch { }
+            Set-ItemProperty -Path $bk -Name ("P{0}" -f $i) -Value $s.Path
+            Set-ItemProperty -Path $bk -Name ("N{0}" -f $i) -Value $s.Name
+            Set-ItemProperty -Path $bk -Name ("T{0}" -f $i) -Value $s.Type
+            Set-ItemProperty -Path $bk -Name ("E{0}" -f $i) -Value $existed
+            Set-ItemProperty -Path $bk -Name ("V{0}" -f $i) -Value $orig
+            if (-not (Test-Path $s.Path)) { $null = New-Item -Path $s.Path -Force -ErrorAction Stop }
+            Remove-ItemProperty -Path $s.Path -Name $s.Name -Force -ErrorAction SilentlyContinue
+            $val = if ($s.Type -eq 'DWord') { [int]$s.Value } else { [string]$s.Value }
+            $null = New-ItemProperty -Path $s.Path -Name $s.Name -PropertyType $s.Type -Value $val -Force -ErrorAction Stop
+            $i++
+        }
+        Set-ItemProperty -Path $bk -Name 'Count' -Value $i
+        Write-Log ("Tweak applied: {0}" -f $Tweak.Name)
+        return @{ Success=$true; Message='Applied (original values backed up)' }
+    } catch {
+        return @{ Success=$false; Message=$_.Exception.Message }
+    }
+}
+
+function Invoke-TweakRevert {
+    param($Tweak)
+    try {
+        $bk = Join-Path $script:TweakBackupKey $Tweak.Key
+        if (-not (Test-Path $bk)) { return @{ Success=$false; Message='No backup found - it was not applied by this app' } }
+        $b = Get-ItemProperty -Path $bk -ErrorAction Stop
+        $count = [int]$b.Count
+        for ($i = 0; $i -lt $count; $i++) {
+            $path = [string]$b.("P{0}" -f $i)
+            $name = [string]$b.("N{0}" -f $i)
+            $type = [string]$b.("T{0}" -f $i)
+            $existed = [int]$b.("E{0}" -f $i)
+            $orig = [string]$b.("V{0}" -f $i)
+            if (-not (Test-Path $path)) { continue }
+            Remove-ItemProperty -Path $path -Name $name -Force -ErrorAction SilentlyContinue
+            if ($existed -eq 1) {
+                $val = if ($type -eq 'DWord') { [int]$orig } else { $orig }
+                $null = New-ItemProperty -Path $path -Name $name -PropertyType $type -Value $val -Force -ErrorAction Stop
+            }
+        }
+        Remove-Item -Path $bk -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log ("Tweak reverted: {0}" -f $Tweak.Name)
+        return @{ Success=$true; Message='Reverted to original values' }
+    } catch {
+        return @{ Success=$false; Message=$_.Exception.Message }
+    }
+}
+
+function Show-HiveReport {
+    $sb = New-Object System.Text.StringBuilder
+    $null = $sb.AppendLine('Registry hive sizes on disk:')
+    $null = $sb.AppendLine('')
+    $sys = Join-Path $env:windir 'System32\config'
+    foreach ($h in @('SOFTWARE','SYSTEM','DEFAULT','SAM','SECURITY')) {
+        try {
+            $f = Get-Item -LiteralPath (Join-Path $sys $h) -Force -ErrorAction Stop
+            $null = $sb.AppendLine(("  {0,-12} {1,10}" -f $h, (Format-Bytes $f.Length)))
+        } catch { }
+    }
+    foreach ($u in @((Join-Path $env:USERPROFILE 'NTUSER.DAT'), (Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\UsrClass.dat'))) {
+        try {
+            $f = Get-Item -LiteralPath $u -Force -ErrorAction Stop
+            $null = $sb.AppendLine(("  {0,-12} {1,10}" -f $f.Name, (Format-Bytes $f.Length)))
+        } catch { }
+    }
+    $null = $sb.AppendLine('')
+    $null = $sb.AppendLine('Good to know: since Windows 8.1 the OS compacts registry hives itself at boot')
+    $null = $sb.AppendLine('when worthwhile. Third-party "registry defrag" tools are unnecessary and risky,')
+    $null = $sb.AppendLine('so this app deliberately does not offer one.')
+    [System.Windows.Forms.MessageBox]::Show($sb.ToString(), $script:AppName, 'OK', 'Information') | Out-Null
+}
+
+function Backup-UserHive {
+    Set-Status 'Exporting HKCU\Software to a .reg backup (can take a minute)...'
+    $file = Join-Path $script:BackupDir ("HKCU_Software_full_{0}.reg" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $null = & "$env:SystemRoot\System32\reg.exe" export 'HKEY_CURRENT_USER\Software' $file /y 2>&1
+    if (Test-Path -LiteralPath $file) {
+        Set-Status ("User registry backed up: {0} ({1})" -f $file, (Format-Bytes (Get-Item -LiteralPath $file).Length))
+        return $true
+    }
+    Set-Status 'User registry backup FAILED - nothing was written.'
+    return $false
+}
+
+# ============================================================================
+#  Material design framework (Google-style palette, flat controls, hover states)
+# ============================================================================
+$script:Palette = @{
+    Blue='#1A73E8'; BlueDark='#185ABC'; BlueLight='#E8F0FE'
+    Red='#D93025';  RedDark='#B3261E'
+    Green='#188038'; Amber='#E37400'; Yellow='#F9AB00'
+    Text='#202124'; SubText='#5F6368'
+    Border='#DADCE0'; Bg='#FFFFFF'; SideBg='#F8F9FA'; Hover='#F1F3F4'
+}
+function Get-Color { param([string]$Key) [System.Drawing.ColorTranslator]::FromHtml($script:Palette[$Key]) }
+
+$script:FontTitle    = New-Object System.Drawing.Font('Segoe UI Semibold', 15)
+$script:FontSubtitle = New-Object System.Drawing.Font('Segoe UI', 9)
+$script:FontBody     = New-Object System.Drawing.Font('Segoe UI', 9)
+$script:FontButton   = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
+$script:FontNav      = New-Object System.Drawing.Font('Segoe UI', 10)
+$script:FontGlyph    = New-Object System.Drawing.Font('Segoe MDL2 Assets', 12)
+$script:FontStat     = New-Object System.Drawing.Font('Segoe UI Semibold', 14)
+
+function New-MatButton {
+    param([string]$Text, [int]$X, [int]$Y, [int]$W = 160, [int]$H = 34,
+          [string]$Style = 'Secondary', [scriptblock]$OnClick)
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $Text
     $b.Location = New-Object System.Drawing.Point($X, $Y)
     $b.Size = New-Object System.Drawing.Size($W, $H)
+    $b.FlatStyle = 'Flat'
+    $b.Font = $script:FontButton
+    $b.Cursor = 'Hand'
+    $b.UseVisualStyleBackColor = $false
+    switch ($Style) {
+        'Primary' {
+            $b.BackColor = Get-Color 'Blue';  $b.ForeColor = [System.Drawing.Color]::White
+            $b.FlatAppearance.BorderSize = 0
+            $b.Tag = @{ Base = (Get-Color 'Blue'); Hover = (Get-Color 'BlueDark') }
+        }
+        'Danger' {
+            $b.BackColor = Get-Color 'Red';   $b.ForeColor = [System.Drawing.Color]::White
+            $b.FlatAppearance.BorderSize = 0
+            $b.Tag = @{ Base = (Get-Color 'Red'); Hover = (Get-Color 'RedDark') }
+        }
+        default {
+            $b.BackColor = Get-Color 'Bg';    $b.ForeColor = Get-Color 'Blue'
+            $b.FlatAppearance.BorderSize = 1
+            $b.FlatAppearance.BorderColor = Get-Color 'Border'
+            $b.Tag = @{ Base = (Get-Color 'Bg'); Hover = (Get-Color 'BlueLight') }
+        }
+    }
+    $b.Add_MouseEnter({ $this.BackColor = $this.Tag.Hover })
+    $b.Add_MouseLeave({ $this.BackColor = $this.Tag.Base })
     if ($OnClick) { $b.Add_Click($OnClick) }
     return $b
 }
 
 function New-Lbl {
-    param([string]$Text, [int]$X, [int]$Y, [int]$W = 700, [int]$H = 18, [bool]$Bold = $false)
+    param([string]$Text, [int]$X, [int]$Y, [int]$W = 700, [int]$H = 18, [string]$Color = 'SubText', [bool]$Bold = $false)
     $l = New-Object System.Windows.Forms.Label
     $l.Text = $Text
     $l.Location = New-Object System.Drawing.Point($X, $Y)
     $l.Size = New-Object System.Drawing.Size($W, $H)
-    if ($Bold) { $l.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold) }
+    $l.ForeColor = Get-Color $Color
+    $l.BackColor = [System.Drawing.Color]::Transparent
+    if ($Bold) { $l.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9) } else { $l.Font = $script:FontSubtitle }
     return $l
+}
+
+function New-PageHeader {
+    param([string]$Title, [string]$Subtitle)
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Dock = 'Top'; $p.Height = 72; $p.BackColor = Get-Color 'Bg'
+    $t = New-Object System.Windows.Forms.Label
+    $t.Text = $Title; $t.Font = $script:FontTitle; $t.ForeColor = Get-Color 'Text'
+    $t.Location = New-Object System.Drawing.Point(24, 12); $t.Size = New-Object System.Drawing.Size(700, 32)
+    $p.Controls.Add($t)
+    $s = New-Object System.Windows.Forms.Label
+    $s.Text = $Subtitle; $s.Font = $script:FontSubtitle; $s.ForeColor = Get-Color 'SubText'
+    $s.Location = New-Object System.Drawing.Point(26, 46); $s.Size = New-Object System.Drawing.Size(1100, 20)
+    $p.Controls.Add($s)
+    return $p
 }
 
 function New-CheckedListView {
@@ -933,118 +1215,301 @@ function New-CheckedListView {
     $lv = New-Object System.Windows.Forms.ListView
     $lv.View = 'Details'
     $lv.FullRowSelect = $true
-    $lv.GridLines = $true
+    $lv.GridLines = $false
     $lv.CheckBoxes = $CheckBoxes
     $lv.Dock = 'Fill'
     $lv.HideSelection = $false
+    $lv.BorderStyle = 'None'
+    $lv.BackColor = Get-Color 'Bg'
+    $lv.ForeColor = Get-Color 'Text'
+    $lv.Font = $script:FontBody
     for ($i = 0; $i -lt $Columns.Count; $i++) {
         $null = $lv.Columns.Add($Columns[$i], $Widths[$i])
     }
     return $lv
 }
 
+function New-LvCard {
+    # Wraps a control in a white card with a hairline border and page margins.
+    param($Inner)
+    $outer = New-Object System.Windows.Forms.Panel
+    $outer.Dock = 'Fill'; $outer.BackColor = Get-Color 'Bg'
+    $outer.Padding = New-Object System.Windows.Forms.Padding(24, 8, 24, 20)
+    $frame = New-Object System.Windows.Forms.Panel
+    $frame.Dock = 'Fill'; $frame.BackColor = Get-Color 'Border'
+    $frame.Padding = New-Object System.Windows.Forms.Padding(1)
+    $frame.Controls.Add($Inner)
+    $outer.Controls.Add($frame)
+    return $outer
+}
+
+function New-Toolbar {
+    param([int]$Height = 56)
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Dock = 'Top'; $p.Height = $Height; $p.BackColor = Get-Color 'Bg'
+    return $p
+}
+
+# ============================================================================
+#  App shell: window, header, sidebar navigation, status bar
+# ============================================================================
+$script:Form = New-Object System.Windows.Forms.Form
+$script:Form.Text = "$($script:AppName)"
+$script:Form.Size = New-Object System.Drawing.Size(1260, 800)
+$script:Form.MinimumSize = New-Object System.Drawing.Size(1080, 680)
+$script:Form.StartPosition = 'CenterScreen'
+$script:Form.Font = $script:FontBody
+$script:Form.BackColor = Get-Color 'Bg'
+
+# content host: a TabControl with its headers hidden (pages switched by the sidebar)
+$script:Tabs = New-Object System.Windows.Forms.TabControl
+$script:Tabs.Dock = 'Fill'
+$script:Tabs.Appearance = 'FlatButtons'
+$script:Tabs.ItemSize = New-Object System.Drawing.Size(0, 1)
+$script:Tabs.SizeMode = 'Fixed'
+
+# sidebar
+$script:Sidebar = New-Object System.Windows.Forms.Panel
+$script:Sidebar.Dock = 'Left'; $script:Sidebar.Width = 216
+$script:Sidebar.BackColor = Get-Color 'SideBg'
+
+# status bar
+$script:StatusBar = New-Object System.Windows.Forms.Panel
+$script:StatusBar.Dock = 'Bottom'; $script:StatusBar.Height = 30
+$script:StatusBar.BackColor = Get-Color 'SideBg'
+$script:StatusLabel = New-Object System.Windows.Forms.Label
+$script:StatusLabel.Dock = 'Fill'
+$script:StatusLabel.TextAlign = 'MiddleLeft'
+$script:StatusLabel.Padding = New-Object System.Windows.Forms.Padding(14, 0, 0, 0)
+$script:StatusLabel.ForeColor = Get-Color 'SubText'
+$script:StatusLabel.Text = 'Ready. Everything is preview-first: nothing changes until you confirm.'
+$script:StatusBar.Controls.Add($script:StatusLabel)
+
+# header bar with Google-style four-dot accent
+$script:Header = New-Object System.Windows.Forms.Panel
+$script:Header.Dock = 'Top'; $script:Header.Height = 60
+$script:Header.BackColor = Get-Color 'Bg'
+$dotColors = @('Blue','Red','Yellow','Green')
+for ($i = 0; $i -lt 4; $i++) {
+    $dot = New-Object System.Windows.Forms.Label
+    $dot.Text = [string][char]0x25CF
+    $dot.Font = New-Object System.Drawing.Font('Segoe UI', 11)
+    $dot.ForeColor = Get-Color $dotColors[$i]
+    $dot.Location = New-Object System.Drawing.Point((20 + $i * 16), 17)
+    $dot.Size = New-Object System.Drawing.Size(18, 24)
+    $script:Header.Controls.Add($dot)
+}
+$hTitle = New-Object System.Windows.Forms.Label
+$hTitle.Text = 'Smart PC Cleaner'
+$hTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 13)
+$hTitle.ForeColor = Get-Color 'Text'
+$hTitle.Location = New-Object System.Drawing.Point(92, 15)
+$hTitle.Size = New-Object System.Drawing.Size(240, 28)
+$script:Header.Controls.Add($hTitle)
+$hBadge = New-Object System.Windows.Forms.Label
+$hBadge.Text = $(if ($script:IsAdmin) { '  Administrator  ' } else { '  Standard user - some features limited  ' })
+$hBadge.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
+$hBadge.BackColor = $(if ($script:IsAdmin) { Get-Color 'BlueLight' } else { Get-Color 'Hover' })
+$hBadge.ForeColor = $(if ($script:IsAdmin) { Get-Color 'Blue' } else { Get-Color 'SubText' })
+$hBadge.AutoSize = $true
+$hBadge.Location = New-Object System.Drawing.Point(340, 20)
+$script:Header.Controls.Add($hBadge)
+$hRule = New-Object System.Windows.Forms.Panel
+$hRule.Dock = 'Bottom'; $hRule.Height = 1; $hRule.BackColor = Get-Color 'Border'
+$script:Header.Controls.Add($hRule)
+
+# dock order: last added docks first -> header top, status bottom, sidebar left, tabs fill
+$script:Form.Controls.Add($script:Tabs)
+$script:Form.Controls.Add($script:Sidebar)
+$script:Form.Controls.Add($script:StatusBar)
+$script:Form.Controls.Add($script:Header)
+
+function Set-Status {
+    param([string]$Text)
+    $script:StatusLabel.Text = $Text
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+# --- sidebar nav items (composite: glyph label + text label on a click panel)
+$script:NavItems = @()
+
+function Select-Page {
+    param([int]$Index)
+    $script:Tabs.SelectedIndex = $Index
+    foreach ($ni in $script:NavItems) {
+        if ($ni.Index -eq $Index) {
+            $ni.Panel.BackColor = Get-Color 'BlueLight'
+            $ni.Glyph.ForeColor = Get-Color 'Blue'
+            $ni.Label.ForeColor = Get-Color 'Blue'
+            $ni.Label.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10)
+        } else {
+            $ni.Panel.BackColor = Get-Color 'SideBg'
+            $ni.Glyph.ForeColor = Get-Color 'SubText'
+            $ni.Label.ForeColor = Get-Color 'Text'
+            $ni.Label.Font = $script:FontNav
+        }
+    }
+}
+
+function Add-NavItem {
+    param([string]$Text, [int]$GlyphCode, [int]$Index)
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Size = New-Object System.Drawing.Size(200, 42)
+    $p.Location = New-Object System.Drawing.Point(8, (16 + $Index * 48))
+    $p.BackColor = Get-Color 'SideBg'
+    $p.Cursor = 'Hand'
+    $g = New-Object System.Windows.Forms.Label
+    $g.Text = [string][char]$GlyphCode
+    $g.Font = $script:FontGlyph
+    $g.ForeColor = Get-Color 'SubText'
+    $g.Location = New-Object System.Drawing.Point(14, 11)
+    $g.Size = New-Object System.Drawing.Size(26, 22)
+    $g.BackColor = [System.Drawing.Color]::Transparent
+    $g.Cursor = 'Hand'
+    $t = New-Object System.Windows.Forms.Label
+    $t.Text = $Text
+    $t.Font = $script:FontNav
+    $t.ForeColor = Get-Color 'Text'
+    $t.Location = New-Object System.Drawing.Point(48, 10)
+    $t.Size = New-Object System.Drawing.Size(146, 24)
+    $t.BackColor = [System.Drawing.Color]::Transparent
+    $t.Cursor = 'Hand'
+    $p.Controls.Add($g); $p.Controls.Add($t)
+    $p.Tag = $Index; $g.Tag = $Index; $t.Tag = $Index
+    $click = { Select-Page -Index ([int]$this.Tag) }
+    $p.Add_Click($click); $g.Add_Click($click); $t.Add_Click($click)
+    $enter = {
+        $idx = [int]$this.Tag
+        $ni = $script:NavItems | Where-Object { $_.Index -eq $idx }
+        if ($ni -and $script:Tabs.SelectedIndex -ne $idx) { $ni.Panel.BackColor = Get-Color 'Hover' }
+    }
+    $leave = {
+        $idx = [int]$this.Tag
+        $ni = $script:NavItems | Where-Object { $_.Index -eq $idx }
+        if ($ni -and $script:Tabs.SelectedIndex -ne $idx) { $ni.Panel.BackColor = Get-Color 'SideBg' }
+    }
+    $p.Add_MouseEnter($enter); $p.Add_MouseLeave($leave)
+    $g.Add_MouseEnter($enter); $t.Add_MouseEnter($enter)
+    $g.Add_MouseLeave($leave); $t.Add_MouseLeave($leave)
+    $script:Sidebar.Controls.Add($p)
+    $script:NavItems += [pscustomobject]@{ Index = $Index; Panel = $p; Glyph = $g; Label = $t }
+}
+
 # ----------------------------------------------------------------------------
-#  TAB 1: Dashboard
+#  PAGE 0: Dashboard
 # ----------------------------------------------------------------------------
 $tabDash = New-Object System.Windows.Forms.TabPage
-$tabDash.Text = ' Dashboard '
+$tabDash.BackColor = Get-Color 'Bg'
 $null = $script:Tabs.TabPages.Add($tabDash)
 
-$dashInfo = New-Object System.Windows.Forms.TextBox
-$dashInfo.Multiline = $true
-$dashInfo.ReadOnly = $true
-$dashInfo.ScrollBars = 'Vertical'
-$dashInfo.Dock = 'Fill'
-$dashInfo.Font = New-Object System.Drawing.Font('Consolas', 10)
+$script:DriveLV = New-CheckedListView -Columns @('Drive', 'Free space', 'Total size', 'Free %', 'Status') -Widths @(90, 140, 140, 90, 400) -CheckBoxes $false
 
-$dashTop = New-Object System.Windows.Forms.Panel
-$dashTop.Dock = 'Top'
-$dashTop.Height = 92
+# stat cards row
+$dashStats = New-Object System.Windows.Forms.Panel
+$dashStats.Dock = 'Top'; $dashStats.Height = 112; $dashStats.BackColor = Get-Color 'Bg'
+$script:StatVals = @()
+$statCaptions = @('Windows', 'Uptime', 'Memory free', 'System drive free')
+for ($i = 0; $i -lt 4; $i++) {
+    $frame = New-Object System.Windows.Forms.Panel
+    $frame.Location = New-Object System.Drawing.Point((24 + $i * 268), 8)
+    $frame.Size = New-Object System.Drawing.Size(252, 88)
+    $frame.BackColor = Get-Color 'Border'
+    $frame.Padding = New-Object System.Windows.Forms.Padding(1)
+    $card = New-Object System.Windows.Forms.Panel
+    $card.Dock = 'Fill'; $card.BackColor = Get-Color 'Bg'
+    $val = New-Object System.Windows.Forms.Label
+    $val.Text = '-'
+    $val.Font = $script:FontStat
+    $val.ForeColor = Get-Color 'Text'
+    $val.Location = New-Object System.Drawing.Point(14, 14)
+    $val.Size = New-Object System.Drawing.Size(224, 30)
+    $cap = New-Object System.Windows.Forms.Label
+    $cap.Text = $statCaptions[$i]
+    $cap.Font = $script:FontSubtitle
+    $cap.ForeColor = Get-Color 'SubText'
+    $cap.Location = New-Object System.Drawing.Point(15, 50)
+    $cap.Size = New-Object System.Drawing.Size(224, 20)
+    $card.Controls.Add($val); $card.Controls.Add($cap)
+    $frame.Controls.Add($card)
+    $dashStats.Controls.Add($frame)
+    $script:StatVals += $val
+}
 
-$dashTop.Controls.Add((New-Btn -Text 'Refresh system info' -X 10 -Y 10 -OnClick { Update-Dashboard }))
-$dashTop.Controls.Add((New-Btn -Text 'Run Safe Quick Clean' -X 190 -Y 10 -W 190 -OnClick { Invoke-QuickClean }))
-$dashTop.Controls.Add((New-Btn -Text 'Create Restore Point' -X 390 -Y 10 -OnClick { $null = New-SafetyRestorePoint }))
-$dashTop.Controls.Add((New-Btn -Text 'Add desktop icon' -X 570 -Y 10 -OnClick {
+$dashBar = New-Toolbar -Height 54
+$dashBar.Controls.Add((New-MatButton -Text 'Run Safe Quick Clean' -X 24 -Y 10 -W 180 -Style 'Primary' -OnClick { Invoke-QuickClean }))
+$dashBar.Controls.Add((New-MatButton -Text 'Refresh' -X 214 -Y 10 -W 110 -OnClick { Update-Dashboard }))
+$dashBar.Controls.Add((New-MatButton -Text 'Create restore point' -X 334 -Y 10 -W 170 -OnClick { $null = New-SafetyRestorePoint }))
+$dashBar.Controls.Add((New-MatButton -Text 'Add desktop icon' -X 514 -Y 10 -W 150 -OnClick {
     if (New-DesktopShortcut) {
         [System.Windows.Forms.MessageBox]::Show('Desktop icon created.', $script:AppName, 'OK', 'Information') | Out-Null
     }
 }))
-$dashTop.Controls.Add((New-Btn -Text 'Open log folder' -X 750 -Y 10 -W 150 -OnClick {
+$dashBar.Controls.Add((New-MatButton -Text 'Open logs' -X 674 -Y 10 -W 110 -OnClick {
     Start-Process explorer.exe -ArgumentList $script:LogDir
 }))
-$dashTop.Controls.Add((New-Lbl -Text 'Quick Clean only touches always-safe items: aged user temp files, thumbnail/shader caches and error-report queues. Everything else lives in its own tab with previews.' -X 12 -Y 52 -W 1100 -H 34))
 
-$tabDash.Controls.Add($dashInfo)
-$tabDash.Controls.Add($dashTop)
+$tabDash.Controls.Add((New-LvCard -Inner $script:DriveLV))
+$tabDash.Controls.Add($dashStats)
+$tabDash.Controls.Add($dashBar)
+$tabDash.Controls.Add((New-PageHeader -Title 'Dashboard' -Subtitle 'System at a glance. Quick Clean touches only always-safe items - everything else lives in its own page with previews.'))
 
 function Update-Dashboard {
     Set-Status 'Reading system information...'
-    $sb = New-Object System.Text.StringBuilder
     try {
-        $os  = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-        $cs  = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-        $cpu = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
-        $null = $sb.AppendLine('SYSTEM')
-        $null = $sb.AppendLine('------')
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
         if ($os) {
-            $null = $sb.AppendLine(("  OS        : {0} (build {1})" -f $os.Caption, $os.BuildNumber))
+            $script:StatVals[0].Text = ('Build {0}' -f $os.BuildNumber)
             $up = (Get-Date) - $os.LastBootUpTime
-            $null = $sb.AppendLine(("  Uptime    : {0}d {1}h {2}m" -f [int]$up.TotalDays, $up.Hours, $up.Minutes))
+            $script:StatVals[1].Text = ('{0}d {1}h {2}m' -f [int]$up.TotalDays, $up.Hours, $up.Minutes)
             $totalMB = [int]($os.TotalVisibleMemorySize / 1024)
             $freeMB  = [int]($os.FreePhysicalMemory / 1024)
-            $null = $sb.AppendLine(("  Memory    : {0:N0} MB free of {1:N0} MB ({2:N0}% free)" -f $freeMB, $totalMB, (100.0 * $freeMB / [Math]::Max(1,$totalMB))))
+            $script:StatVals[2].Text = ('{0:N1} / {1:N1} GB' -f ($freeMB / 1024.0), ($totalMB / 1024.0))
         }
-        if ($cpu) { $null = $sb.AppendLine(("  CPU       : {0}" -f $cpu.Name.Trim())) }
-        if ($cs)  { $null = $sb.AppendLine(("  Machine   : {0}" -f $cs.Model)) }
-        $null = $sb.AppendLine('')
-        $null = $sb.AppendLine('DRIVES')
-        $null = $sb.AppendLine('------')
+        $script:DriveLV.Items.Clear()
         foreach ($d in [IO.DriveInfo]::GetDrives()) {
             if (-not $d.IsReady) { continue }
             if ($d.DriveType -notin @([IO.DriveType]::Fixed, [IO.DriveType]::Removable)) { continue }
             $pctFree = 0
             if ($d.TotalSize -gt 0) { $pctFree = [int](100.0 * $d.TotalFreeSpace / $d.TotalSize) }
-            $barLen = 30
-            $usedBars = [int]($barLen * (100 - $pctFree) / 100)
-            $bar = ('#' * $usedBars).PadRight($barLen, '-')
-            $warn = ''
-            if ($pctFree -lt 10) { $warn = '   << LOW SPACE' }
-            $null = $sb.AppendLine(("  {0}  [{1}] {2,3}% free   {3} free of {4}{5}" -f $d.Name, $bar, $pctFree,
-                (Format-Bytes $d.TotalFreeSpace), (Format-Bytes $d.TotalSize), $warn))
+            if ($d.Name -like ($env:SystemDrive + '*')) {
+                $script:StatVals[3].Text = ('{0} ({1}%)' -f (Format-Bytes $d.TotalFreeSpace), $pctFree)
+            }
+            $li = New-Object System.Windows.Forms.ListViewItem($d.Name)
+            $null = $li.SubItems.Add((Format-Bytes $d.TotalFreeSpace))
+            $null = $li.SubItems.Add((Format-Bytes $d.TotalSize))
+            $null = $li.SubItems.Add(("{0}%" -f $pctFree))
+            if ($pctFree -lt 10) {
+                $null = $li.SubItems.Add('Low space - run Cleanup, or move large items with the Mover')
+                $li.ForeColor = Get-Color 'Red'
+            } elseif ($pctFree -lt 20) {
+                $null = $li.SubItems.Add('Getting full - worth a cleanup pass')
+                $li.ForeColor = Get-Color 'Amber'
+            } else {
+                $null = $li.SubItems.Add('Healthy')
+                $li.ForeColor = Get-Color 'Green'
+            }
+            $null = $script:DriveLV.Items.Add($li)
         }
-        $null = $sb.AppendLine('')
-        $null = $sb.AppendLine('SAFETY')
-        $null = $sb.AppendLine('------')
-        $null = $sb.AppendLine("  Log file          : $($script:LogFile)")
-        $null = $sb.AppendLine("  Registry backups  : $($script:BackupDir)")
-        $null = $sb.AppendLine("  Move history      : $($script:MoveLogCsv)")
-        $null = $sb.AppendLine('')
-        $null = $sb.AppendLine('  Every destructive action in this app: previews first, backs up what it can, skips')
-        $null = $sb.AppendLine('  files that are recent or in use, and refuses system-critical locations outright.')
     } catch {
-        $null = $sb.AppendLine("Error reading system info: $($_.Exception.Message)")
+        Write-Log ("Dashboard refresh error: {0}" -f $_.Exception.Message) 'WARN'
     }
-    $dashInfo.Text = $sb.ToString()
     Set-Status 'Ready.'
 }
 
 # ----------------------------------------------------------------------------
-#  TAB 2: System Cleanup
+#  PAGE 1: System Cleanup
 # ----------------------------------------------------------------------------
 $tabClean = New-Object System.Windows.Forms.TabPage
-$tabClean.Text = ' System Cleanup '
+$tabClean.BackColor = Get-Color 'Bg'
 $null = $script:Tabs.TabPages.Add($tabClean)
 
-$script:CleanLV = New-CheckedListView -Columns @('Cleanup item', 'Reclaimable', 'Notes') -Widths @(260, 110, 700)
-$cleanTop = New-Object System.Windows.Forms.Panel
-$cleanTop.Dock = 'Top'
-$cleanTop.Height = 78
-
-$cleanTop.Controls.Add((New-Btn -Text '1. Scan (preview sizes)' -X 10 -Y 10 -W 180 -OnClick { Invoke-CleanScan }))
-$cleanTop.Controls.Add((New-Btn -Text '2. Clean checked items' -X 200 -Y 10 -W 180 -OnClick { Invoke-CleanRun }))
-$cleanTop.Controls.Add((New-Lbl -Text 'Scan is read-only. Cleaning skips files in use and files newer than each item''s safety age, so active apps and AI agents are never disturbed.' -X 12 -Y 48 -W 1100 -H 24))
-$tabClean.Controls.Add($script:CleanLV)
-$tabClean.Controls.Add($cleanTop)
+$script:CleanLV = New-CheckedListView -Columns @('Cleanup item', 'Reclaimable', 'Notes') -Widths @(260, 120, 620)
+$cleanBar = New-Toolbar
+$cleanBar.Controls.Add((New-MatButton -Text 'Scan  (preview sizes)' -X 24 -Y 10 -W 180 -Style 'Primary' -OnClick { Invoke-CleanScan }))
+$cleanBar.Controls.Add((New-MatButton -Text 'Clean checked items' -X 214 -Y 10 -W 180 -OnClick { Invoke-CleanRun }))
+$tabClean.Controls.Add((New-LvCard -Inner $script:CleanLV))
+$tabClean.Controls.Add($cleanBar)
+$tabClean.Controls.Add((New-PageHeader -Title 'System Cleanup' -Subtitle 'Scan is read-only. Cleaning skips files in use and files newer than each item''s safety age, so active apps and AI agents are never disturbed.'))
 
 $script:CleanLV.Add_ItemCheck({
     param($sender, $e)
@@ -1065,7 +1530,7 @@ function Invoke-CleanScan {
         if ($t.Special -eq 'RecycleBin') {
             $size = Get-RecycleBinSize
         } elseif ($t.Special -eq 'DO') {
-            $size = -1   # size not cheaply known
+            $size = -1
         } else {
             foreach ($p in $t.Paths) {
                 if (Test-Path -LiteralPath $p) { $size += Get-PathSize -Path $p }
@@ -1079,7 +1544,7 @@ function Invoke-CleanScan {
         if ($t.Admin -and -not $script:IsAdmin) { $notes = '[needs Admin] ' + $notes }
         $null = $li.SubItems.Add($notes)
         $li.Tag = $t
-        if ($t.Admin -and -not $script:IsAdmin) { $li.ForeColor = [System.Drawing.Color]::Gray }
+        if ($t.Admin -and -not $script:IsAdmin) { $li.ForeColor = Get-Color 'SubText' }
         $null = $script:CleanLV.Items.Add($li)
     }
     Set-Status ("Scan complete. Up to {0} reclaimable (actual amount depends on what is in use). Tick items, then Clean." -f (Format-Bytes $total))
@@ -1122,6 +1587,7 @@ function Invoke-CleanRun {
                 $li.SubItems[1].Text = ('freed ' + (Format-Bytes $itemFreed))
             }
             $li.Checked = $false
+            $li.ForeColor = Get-Color 'Green'
         } catch {
             Write-Log ("Clean error on {0}: {1}" -f $t.Name, $_.Exception.Message) 'ERROR'
         }
@@ -1147,28 +1613,26 @@ function Invoke-QuickClean {
             $freed += $r.FreedBytes
         }
     }
+    Update-Dashboard
     Set-Status ("Quick Clean done - freed {0}." -f (Format-Bytes $freed))
     [System.Windows.Forms.MessageBox]::Show(("Quick Clean done.`nFreed: {0}" -f (Format-Bytes $freed)), $script:AppName, 'OK', 'Information') | Out-Null
 }
 
 # ----------------------------------------------------------------------------
-#  TAB 3: AI Tools (Claude / ChatGPT / Codex / Cursor / VS Code)
+#  PAGE 2: AI Tools
 # ----------------------------------------------------------------------------
 $tabAI = New-Object System.Windows.Forms.TabPage
-$tabAI.Text = ' AI Tools '
+$tabAI.BackColor = Get-Color 'Bg'
 $null = $script:Tabs.TabPages.Add($tabAI)
 
-$script:AILV = New-CheckedListView -Columns @('Tool', 'Item', 'Size', 'Verdict', 'Notes', 'Path') -Widths @(120, 200, 100, 90, 380, 260)
-$aiTop = New-Object System.Windows.Forms.Panel
-$aiTop.Dock = 'Top'
-$aiTop.Height = 78
-
-$aiTop.Controls.Add((New-Btn -Text '1. Scan AI tool data' -X 10 -Y 10 -W 170 -OnClick { Invoke-AIScan }))
-$aiTop.Controls.Add((New-Btn -Text '2. Clean checked caches' -X 190 -Y 10 -W 180 -OnClick { Invoke-AIClean }))
-$aiTop.Controls.Add((New-Btn -Text 'Send checked to Mover ->' -X 380 -Y 10 -W 190 -OnClick { Invoke-AISendToMover }))
-$aiTop.Controls.Add((New-Lbl -Text 'Verdicts:  CLEAN = safe cache/log data (tickable).  MOVE = user data such as sessions & model weights - send it to the Mover tab instead of deleting.  KEEP = configs & credentials, never touch (cannot be ticked).' -X 12 -Y 48 -W 1140 -H 26))
-$tabAI.Controls.Add($script:AILV)
-$tabAI.Controls.Add($aiTop)
+$script:AILV = New-CheckedListView -Columns @('Tool', 'Item', 'Size', 'Verdict', 'Notes', 'Path') -Widths @(120, 190, 100, 90, 360, 250)
+$aiBar = New-Toolbar
+$aiBar.Controls.Add((New-MatButton -Text 'Scan AI tool data' -X 24 -Y 10 -W 160 -Style 'Primary' -OnClick { Invoke-AIScan }))
+$aiBar.Controls.Add((New-MatButton -Text 'Clean checked caches' -X 194 -Y 10 -W 180 -OnClick { Invoke-AIClean }))
+$aiBar.Controls.Add((New-MatButton -Text 'Send checked to Mover' -X 384 -Y 10 -W 185 -OnClick { Invoke-AISendToMover }))
+$tabAI.Controls.Add((New-LvCard -Inner $script:AILV))
+$tabAI.Controls.Add($aiBar)
+$tabAI.Controls.Add((New-PageHeader -Title 'AI Tools' -Subtitle 'Claude, ChatGPT, Codex, Cursor, VS Code and model stores.  CLEAN = safe caches.  MOVE = sessions & models, send to the Mover.  KEEP = configs & credentials, locked out.'))
 
 $script:AILV.Add_ItemCheck({
     param($sender, $e)
@@ -1197,9 +1661,9 @@ function Invoke-AIScan {
         $null = $li.SubItems.Add($r.Path)
         $li.Tag = $r
         switch ($r.Action) {
-            'Clean'  { $li.ForeColor = [System.Drawing.Color]::FromArgb(20, 110, 20); $cleanTotal += $size }
-            'Review' { $li.ForeColor = [System.Drawing.Color]::FromArgb(160, 90, 0); $moveTotal += $size }
-            default  { $li.ForeColor = [System.Drawing.Color]::Gray }
+            'Clean'  { $li.ForeColor = Get-Color 'Green'; $cleanTotal += $size }
+            'Review' { $li.ForeColor = Get-Color 'Amber'; $moveTotal += $size }
+            default  { $li.ForeColor = Get-Color 'SubText' }
         }
         $null = $script:AILV.Items.Add($li)
     }
@@ -1247,33 +1711,31 @@ function Invoke-AISendToMover {
         $li.Checked = $false
         $sent++
     }
-    $script:Tabs.SelectedTab = $script:TabMove
+    Select-Page -Index 3
     Set-Status ("{0} item(s) added to the Mover list. Review, rename and choose a destination there." -f $sent)
 }
 
 # ----------------------------------------------------------------------------
-#  TAB 4: Move to G:  (large-item mover/organizer)
+#  PAGE 3: Move to G:
 # ----------------------------------------------------------------------------
 $script:TabMove = New-Object System.Windows.Forms.TabPage
-$script:TabMove.Text = ' Move to G: '
+$script:TabMove.BackColor = Get-Color 'Bg'
 $null = $script:Tabs.TabPages.Add($script:TabMove)
 
-$script:MoveLV = New-CheckedListView -Columns @('Name (double-click to rename)', 'Category', 'Size', 'Movable?', 'Why / where', 'Current location') -Widths @(240, 110, 100, 80, 300, 320)
-$moveTop = New-Object System.Windows.Forms.Panel
-$moveTop.Dock = 'Top'
-$moveTop.Height = 122
+$script:MoveLV = New-CheckedListView -Columns @('Name (double-click to rename)', 'Category', 'Size', 'Movable?', 'Why / where', 'Current location') -Widths @(230, 110, 100, 80, 290, 300)
+$moveBar = New-Toolbar -Height 132
 
-$moveTop.Controls.Add((New-Btn -Text '1. Scan for large items' -X 10 -Y 10 -W 170 -OnClick { Invoke-MoveScan }))
-$moveTop.Controls.Add((New-Lbl -Text 'Min size (MB):' -X 190 -Y 16 -W 85 -H 20))
+$moveBar.Controls.Add((New-MatButton -Text 'Scan for large items' -X 24 -Y 8 -W 170 -Style 'Primary' -OnClick { Invoke-MoveScan }))
+$moveBar.Controls.Add((New-Lbl -Text 'Min size (MB)' -X 206 -Y 16 -W 80 -H 20))
 $script:MoveMinSize = New-Object System.Windows.Forms.NumericUpDown
-$script:MoveMinSize.Location = New-Object System.Drawing.Point(278, 13)
-$script:MoveMinSize.Size = New-Object System.Drawing.Size(70, 24)
+$script:MoveMinSize.Location = New-Object System.Drawing.Point(290, 13)
+$script:MoveMinSize.Size = New-Object System.Drawing.Size(70, 26)
 $script:MoveMinSize.Minimum = 10
 $script:MoveMinSize.Maximum = 100000
 $script:MoveMinSize.Value = 200
-$moveTop.Controls.Add($script:MoveMinSize)
-
-$moveTop.Controls.Add((New-Btn -Text 'Add another folder to scan...' -X 360 -Y 10 -W 200 -OnClick {
+$script:MoveMinSize.BorderStyle = 'FixedSingle'
+$moveBar.Controls.Add($script:MoveMinSize)
+$moveBar.Controls.Add((New-MatButton -Text 'Add folder to scan' -X 374 -Y 8 -W 160 -OnClick {
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
     $dlg.Description = 'Pick an extra folder to scan for large items'
     if ($dlg.ShowDialog() -eq 'OK') {
@@ -1282,16 +1744,17 @@ $moveTop.Controls.Add((New-Btn -Text 'Add another folder to scan...' -X 360 -Y 1
         Set-Status ("Added scan root: {0}. Run the scan again." -f $dlg.SelectedPath)
     }
 }))
-$moveTop.Controls.Add((New-Btn -Text 'Open move history' -X 570 -Y 10 -W 150 -OnClick {
+$moveBar.Controls.Add((New-MatButton -Text 'Move history' -X 544 -Y 8 -W 130 -OnClick {
     if (Test-Path -LiteralPath $script:MoveLogCsv) { Start-Process notepad.exe -ArgumentList $script:MoveLogCsv }
     else { Set-Status 'No moves logged yet.' }
 }))
 
-$moveTop.Controls.Add((New-Lbl -Text 'Destination drive:' -X 12 -Y 52 -W 105 -H 20))
+$moveBar.Controls.Add((New-Lbl -Text 'Destination' -X 26 -Y 56 -W 70 -H 20))
 $script:MoveDrive = New-Object System.Windows.Forms.ComboBox
-$script:MoveDrive.Location = New-Object System.Drawing.Point(120, 48)
-$script:MoveDrive.Size = New-Object System.Drawing.Size(70, 24)
+$script:MoveDrive.Location = New-Object System.Drawing.Point(100, 52)
+$script:MoveDrive.Size = New-Object System.Drawing.Size(70, 26)
 $script:MoveDrive.DropDownStyle = 'DropDownList'
+$script:MoveDrive.FlatStyle = 'Flat'
 foreach ($d in [IO.DriveInfo]::GetDrives()) {
     if ($d.IsReady -and $d.DriveType -in @([IO.DriveType]::Fixed, [IO.DriveType]::Removable)) {
         $null = $script:MoveDrive.Items.Add($d.Name)
@@ -1301,38 +1764,43 @@ for ($i = 0; $i -lt $script:MoveDrive.Items.Count; $i++) {
     if ($script:MoveDrive.Items[$i] -like 'G:*') { $script:MoveDrive.SelectedIndex = $i }
 }
 if ($script:MoveDrive.SelectedIndex -lt 0 -and $script:MoveDrive.Items.Count -gt 0) { $script:MoveDrive.SelectedIndex = $script:MoveDrive.Items.Count - 1 }
-$moveTop.Controls.Add($script:MoveDrive)
+$moveBar.Controls.Add($script:MoveDrive)
 
-$moveTop.Controls.Add((New-Lbl -Text 'Base folder:' -X 200 -Y 52 -W 75 -H 20))
+$moveBar.Controls.Add((New-Lbl -Text 'Base folder' -X 184 -Y 56 -W 68 -H 20))
 $script:MoveBase = New-Object System.Windows.Forms.TextBox
-$script:MoveBase.Location = New-Object System.Drawing.Point(278, 48)
-$script:MoveBase.Size = New-Object System.Drawing.Size(160, 24)
+$script:MoveBase.Location = New-Object System.Drawing.Point(256, 52)
+$script:MoveBase.Size = New-Object System.Drawing.Size(150, 26)
 $script:MoveBase.Text = 'Organized'
-$moveTop.Controls.Add($script:MoveBase)
+$script:MoveBase.BorderStyle = 'FixedSingle'
+$moveBar.Controls.Add($script:MoveBase)
 
 $script:MoveAutoCat = New-Object System.Windows.Forms.CheckBox
 $script:MoveAutoCat.Text = 'Auto-sort into category folders (Projects, Media, Documents, AI-Archives...)'
-$script:MoveAutoCat.Location = New-Object System.Drawing.Point(450, 50)
-$script:MoveAutoCat.Size = New-Object System.Drawing.Size(440, 22)
+$script:MoveAutoCat.Location = New-Object System.Drawing.Point(420, 54)
+$script:MoveAutoCat.Size = New-Object System.Drawing.Size(450, 22)
 $script:MoveAutoCat.Checked = $true
-$moveTop.Controls.Add($script:MoveAutoCat)
+$script:MoveAutoCat.ForeColor = Get-Color 'Text'
+$moveBar.Controls.Add($script:MoveAutoCat)
 
-$moveTop.Controls.Add((New-Lbl -Text 'Or one project folder for all:' -X 12 -Y 84 -W 160 -H 20))
+$moveBar.Controls.Add((New-Lbl -Text 'Or one project folder for all' -X 26 -Y 96 -W 150 -H 20))
 $script:MoveProject = New-Object System.Windows.Forms.TextBox
-$script:MoveProject.Location = New-Object System.Drawing.Point(175, 80)
-$script:MoveProject.Size = New-Object System.Drawing.Size(180, 24)
-$moveTop.Controls.Add($script:MoveProject)
+$script:MoveProject.Location = New-Object System.Drawing.Point(184, 92)
+$script:MoveProject.Size = New-Object System.Drawing.Size(170, 26)
+$script:MoveProject.BorderStyle = 'FixedSingle'
+$moveBar.Controls.Add($script:MoveProject)
 
 $script:MoveShortcut = New-Object System.Windows.Forms.CheckBox
 $script:MoveShortcut.Text = 'Leave a shortcut at the old location'
-$script:MoveShortcut.Location = New-Object System.Drawing.Point(370, 82)
+$script:MoveShortcut.Location = New-Object System.Drawing.Point(370, 94)
 $script:MoveShortcut.Size = New-Object System.Drawing.Size(240, 22)
 $script:MoveShortcut.Checked = $true
-$moveTop.Controls.Add($script:MoveShortcut)
+$script:MoveShortcut.ForeColor = Get-Color 'Text'
+$moveBar.Controls.Add($script:MoveShortcut)
 
-$moveTop.Controls.Add((New-Btn -Text '2. Move checked items' -X 620 -Y 78 -W 180 -OnClick { Invoke-MoveRun }))
-$script:TabMove.Controls.Add($script:MoveLV)
-$script:TabMove.Controls.Add($moveTop)
+$moveBar.Controls.Add((New-MatButton -Text 'Move checked items' -X 620 -Y 88 -W 175 -Style 'Primary' -OnClick { Invoke-MoveRun }))
+$script:TabMove.Controls.Add((New-LvCard -Inner $script:MoveLV))
+$script:TabMove.Controls.Add($moveBar)
+$script:TabMove.Controls.Add((New-PageHeader -Title 'Move to G:' -Subtitle 'Find large folders and files, see what can and cannot move, rename and organize into project folders. Copy, verify, then delete - never the other way round.'))
 
 $script:MoveLV.Add_ItemCheck({
     param($sender, $e)
@@ -1360,7 +1828,7 @@ function Add-MoveCandidate {
     param([string]$Path, [string]$SuggestedCategory = $null)
     if (-not (Test-Path -LiteralPath $Path)) { return }
     foreach ($existing in @($script:MoveLV.Items)) {
-        if ($existing.Tag.Path -ieq $Path) { return }   # no duplicates
+        if ($existing.Tag.Path -ieq $Path) { return }
     }
     Set-Status ("Inspecting: {0} ..." -f $Path)
     $size = Get-PathSize -Path $Path
@@ -1379,7 +1847,7 @@ function Add-MoveCandidate {
     $null = $li.SubItems.Add($tag.Reason)
     $null = $li.SubItems.Add($Path)
     $li.Tag = $tag
-    if (-not $tag.Movable) { $li.ForeColor = [System.Drawing.Color]::Gray }
+    if (-not $tag.Movable) { $li.ForeColor = Get-Color 'SubText' }
     $null = $script:MoveLV.Items.Add($li)
 }
 
@@ -1453,17 +1921,18 @@ function Invoke-MoveRun {
             $moved++
             $li.SubItems[3].Text = 'MOVED'
             $li.SubItems[4].Text = $res.Dest
-            $li.ForeColor = [System.Drawing.Color]::FromArgb(20, 110, 20)
+            $li.ForeColor = Get-Color 'Green'
             $li.Checked = $false
             $li.Tag.Movable = $false
             $li.Tag.Reason = 'Already moved'
         } else {
             $failed++
             $li.SubItems[4].Text = ('FAILED: ' + $res.Message)
-            $li.ForeColor = [System.Drawing.Color]::Firebrick
+            $li.ForeColor = Get-Color 'Red'
             Write-Log ("Move failed for {0}: {1}" -f $li.Tag.Path, $res.Message) 'ERROR'
         }
     }
+    Update-Dashboard
     Set-Status ("Move complete: {0} moved, {1} failed. History: {2}" -f $moved, $failed, $script:MoveLogCsv)
     [System.Windows.Forms.MessageBox]::Show(
         ("Move complete.`nMoved: {0}`nFailed: {1}`n`nA log of every move is kept at:`n{2}" -f $moved, $failed, $script:MoveLogCsv),
@@ -1471,21 +1940,16 @@ function Invoke-MoveRun {
 }
 
 # ----------------------------------------------------------------------------
-#  TAB 5: Registry Care
+#  PAGE 4: Registry - Repair & Optimization
 # ----------------------------------------------------------------------------
 $tabReg = New-Object System.Windows.Forms.TabPage
-$tabReg.Text = ' Registry Care '
+$tabReg.BackColor = Get-Color 'Bg'
 $null = $script:Tabs.TabPages.Add($tabReg)
 
-$script:RegLV = New-CheckedListView -Columns @('Issue type', 'Detail', 'Registry key') -Widths @(170, 420, 480)
-$regTop = New-Object System.Windows.Forms.Panel
-$regTop.Dock = 'Top'
-$regTop.Height = 104
-
-$regTop.Controls.Add((New-Btn -Text 'Create Restore Point' -X 10 -Y 10 -OnClick { $null = New-SafetyRestorePoint }))
-$regTop.Controls.Add((New-Btn -Text 'Scan for safe issues' -X 190 -Y 10 -OnClick { Invoke-RegScan }))
-$regTop.Controls.Add((New-Btn -Text 'Fix checked (auto-backup)' -X 370 -Y 10 -W 190 -OnClick { Invoke-RegFix }))
-$regTop.Controls.Add((New-Btn -Text 'Clear recent-file lists' -X 570 -Y 10 -W 170 -OnClick {
+$regBar = New-Toolbar
+$regBar.Controls.Add((New-MatButton -Text 'Create restore point' -X 24 -Y 10 -W 170 -Style 'Primary' -OnClick { $null = New-SafetyRestorePoint }))
+$regBar.Controls.Add((New-MatButton -Text 'Back up user registry' -X 204 -Y 10 -W 175 -OnClick { $null = Backup-UserHive }))
+$regBar.Controls.Add((New-MatButton -Text 'Clear recent-file lists' -X 389 -Y 10 -W 170 -OnClick {
     $answer = [System.Windows.Forms.MessageBox]::Show(
         'Clear Explorer recent-documents and Run-box history? This is a privacy cleanup, backed up first; Windows rebuilds the lists automatically.',
         $script:AppName, 'YesNo', 'Question')
@@ -1494,31 +1958,67 @@ $regTop.Controls.Add((New-Btn -Text 'Clear recent-file lists' -X 570 -Y 10 -W 17
         Set-Status ("Recent-file lists cleared ({0} key(s), backups saved)." -f $n)
     }
 }))
-$regTop.Controls.Add((New-Btn -Text 'Open backup folder' -X 750 -Y 10 -W 160 -OnClick {
+$regBar.Controls.Add((New-MatButton -Text 'Hive size report' -X 569 -Y 10 -W 140 -OnClick { Show-HiveReport }))
+$regBar.Controls.Add((New-MatButton -Text 'Open backups' -X 719 -Y 10 -W 130 -OnClick {
     Start-Process explorer.exe -ArgumentList $script:BackupDir
 }))
-$regTop.Controls.Add((New-Lbl -Text 'Deliberately conservative: this scan only finds entries pointing at programs that no longer exist (orphaned App Paths and non-MSI uninstall leftovers). It never touches drivers, services, file associations or MSI-installed apps - the categories where "registry cleaners" cause damage.' -X 12 -Y 46 -W 1140 -H 30))
-$regTop.Controls.Add((New-Lbl -Text 'Every key is exported to a .reg backup BEFORE deletion - double-click any backup file to restore it. Create a Restore Point first for belt-and-braces safety.' -X 12 -Y 78 -W 1140 -H 20 -Bold $true))
-$tabReg.Controls.Add($script:RegLV)
-$tabReg.Controls.Add($regTop)
+
+$regSplit = New-Object System.Windows.Forms.SplitContainer
+$regSplit.Dock = 'Fill'
+$regSplit.Orientation = 'Horizontal'
+
+# --- top: repair
+$script:RegLV = New-CheckedListView -Columns @('Issue type', 'Detail', 'Registry key / value') -Widths @(190, 420, 440)
+$regRepairBar = New-Object System.Windows.Forms.Panel
+$regRepairBar.Dock = 'Top'; $regRepairBar.Height = 86; $regRepairBar.BackColor = Get-Color 'Bg'
+$regRepairBar.Controls.Add((New-Lbl -Text 'Repair' -X 24 -Y 4 -W 120 -H 20 -Color 'Text' -Bold $true))
+$regRepairBar.Controls.Add((New-Lbl -Text 'Finds only entries pointing at programs that verifiably no longer exist. Never touches drivers, services, file associations or MSI apps.' -X 24 -Y 24 -W 1100 -H 18))
+$regRepairBar.Controls.Add((New-MatButton -Text 'Scan' -X 24 -Y 46 -W 100 -H 32 -Style 'Primary' -OnClick { Invoke-RegScan }))
+$regRepairBar.Controls.Add((New-MatButton -Text 'Repair checked' -X 134 -Y 46 -W 140 -H 32 -OnClick { Invoke-RegFix }))
+$regSplit.Panel1.Controls.Add((New-LvCard -Inner $script:RegLV))
+$regSplit.Panel1.Controls.Add($regRepairBar)
+$regSplit.Panel1.BackColor = Get-Color 'Bg'
+
+# --- bottom: optimization
+$script:TweakLV = New-CheckedListView -Columns @('Optimization', 'Status', 'What it does') -Widths @(280, 100, 680)
+$regOptBar = New-Object System.Windows.Forms.Panel
+$regOptBar.Dock = 'Top'; $regOptBar.Height = 86; $regOptBar.BackColor = Get-Color 'Bg'
+$regOptBar.Controls.Add((New-Lbl -Text 'Optimization' -X 24 -Y 4 -W 160 -H 20 -Color 'Text' -Bold $true))
+$regOptBar.Controls.Add((New-Lbl -Text 'Documented, user-level responsiveness tweaks. Originals are backed up on apply; one click reverts them exactly.' -X 24 -Y 24 -W 1100 -H 18))
+$regOptBar.Controls.Add((New-MatButton -Text 'Apply checked' -X 24 -Y 46 -W 135 -H 32 -Style 'Primary' -OnClick { Invoke-TweakRun -Revert $false }))
+$regOptBar.Controls.Add((New-MatButton -Text 'Revert checked' -X 169 -Y 46 -W 135 -H 32 -OnClick { Invoke-TweakRun -Revert $true }))
+$regOptBar.Controls.Add((New-MatButton -Text 'Refresh' -X 314 -Y 46 -W 100 -H 32 -OnClick { Update-TweakList }))
+$regSplit.Panel2.Controls.Add((New-LvCard -Inner $script:TweakLV))
+$regSplit.Panel2.Controls.Add($regOptBar)
+$regSplit.Panel2.BackColor = Get-Color 'Bg'
+
+$tabReg.Controls.Add($regSplit)
+$tabReg.Controls.Add($regBar)
+$tabReg.Controls.Add((New-PageHeader -Title 'Registry - Repair & Optimization' -Subtitle 'Every change is exported to a .reg backup BEFORE it happens; double-click a backup file to restore it. Create a restore point first for belt-and-braces safety.'))
+try { $regSplit.SplitterDistance = 300 } catch { }
 
 function Invoke-RegScan {
     $script:RegLV.Items.Clear()
-    Set-Status 'Scanning registry for orphaned entries (read-only)...'
+    Set-Status 'Scanning registry for orphaned and broken entries (read-only)...'
     $issues = @()
-    $issues += Get-OrphanedAppPaths
-    $issues += Get-OrphanedUninstallEntries
+    Set-Status 'Scanning: orphaned App Paths ...';        $issues += Get-OrphanedAppPaths
+    Set-Status 'Scanning: orphaned uninstall entries ...'; $issues += Get-OrphanedUninstallEntries
+    Set-Status 'Scanning: broken startup entries ...';     $issues += Get-BrokenRunEntries
+    Set-Status 'Scanning: stale display-name cache ...';   $issues += Get-StaleMuiCache
+    Set-Status 'Scanning: broken shared-DLL counts ...';   $issues += Get-BrokenSharedDlls
     foreach ($i in $issues) {
         $li = New-Object System.Windows.Forms.ListViewItem($i.Type)
         $null = $li.SubItems.Add($i.Detail)
-        $null = $li.SubItems.Add($i.KeyName)
+        $vn = ''
+        if ($i.PSObject.Properties['ValueName'] -and $i.ValueName) { $vn = ('  ->  ' + $i.ValueName) }
+        $null = $li.SubItems.Add($i.KeyName + $vn)
         $li.Tag = $i
         $null = $script:RegLV.Items.Add($li)
     }
     if ($issues.Count -eq 0) {
-        Set-Status 'Registry scan complete - no orphaned entries found. That is a good thing; nothing needs fixing.'
+        Set-Status 'Registry scan complete - no orphaned or broken entries found. Nothing needs fixing.'
     } else {
-        Set-Status ("Registry scan complete - {0} orphaned entr{1} found. Review, tick, then Fix (each is backed up first)." -f $issues.Count, $(if ($issues.Count -eq 1) { 'y' } else { 'ies' }))
+        Set-Status ("Registry scan complete - {0} issue(s) found. Review, tick, then Repair (each is backed up first)." -f $issues.Count)
     }
 }
 
@@ -1527,61 +2027,105 @@ function Invoke-RegFix {
     if ($checked.Count -eq 0) { Set-Status 'Scan and tick at least one issue first.'; return }
     $hklm = @($checked | Where-Object { $_.Tag.KeyName -like 'HKEY_LOCAL_MACHINE*' })
     if ($hklm.Count -gt 0 -and -not $script:IsAdmin) {
-        [System.Windows.Forms.MessageBox]::Show('Some checked keys are machine-wide (HKLM) and need Administrator. Restart the app as Administrator, or untick those.', $script:AppName, 'OK', 'Warning') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show('Some checked entries are machine-wide (HKLM) and need Administrator. Restart the app as Administrator, or untick those.', $script:AppName, 'OK', 'Warning') | Out-Null
         return
     }
     $answer = [System.Windows.Forms.MessageBox]::Show(
-        ("Remove {0} orphaned registry entr{1}?`n`nEach key is exported to a .reg backup first. If a backup export fails, that key is NOT deleted.`n`nTip: create a Restore Point first if you have not today." -f $checked.Count, $(if ($checked.Count -eq 1) { 'y' } else { 'ies' })),
+        ("Repair {0} registry issue(s)?`n`nEach affected key is exported to a .reg backup first. If a backup export fails, that entry is NOT touched.`n`nTip: create a restore point first if you have not today." -f $checked.Count),
         $script:AppName, 'YesNo', 'Question')
     if ($answer -ne 'Yes') { return }
     $fixed = 0
     $failedCount = 0
     foreach ($li in $checked) {
-        Set-Status ("Fixing: {0} ..." -f $li.Tag.KeyName)
-        $res = Remove-RegistryKeySafe -KeyName $li.Tag.KeyName
+        Set-Status ("Repairing: {0} ..." -f $li.Tag.KeyName)
+        $vn = $null
+        if ($li.Tag.PSObject.Properties['ValueName'] -and $li.Tag.ValueName) { $vn = $li.Tag.ValueName }
+        $res = Remove-RegistryItemSafe -KeyName $li.Tag.KeyName -ValueName $vn
         if ($res.Success) {
             $fixed++
             $li.SubItems[1].Text = $res.Message
-            $li.ForeColor = [System.Drawing.Color]::FromArgb(20, 110, 20)
+            $li.ForeColor = Get-Color 'Green'
             $li.Checked = $false
         } else {
             $failedCount++
             $li.SubItems[1].Text = ('NOT removed: ' + $res.Message)
-            $li.ForeColor = [System.Drawing.Color]::Firebrick
+            $li.ForeColor = Get-Color 'Red'
         }
     }
-    Set-Status ("Registry fix done: {0} removed (with backups), {1} skipped. Backups: {2}" -f $fixed, $failedCount, $script:BackupDir)
+    Set-Status ("Registry repair done: {0} fixed (with backups), {1} skipped. Backups: {2}" -f $fixed, $failedCount, $script:BackupDir)
+}
+
+function Update-TweakList {
+    $script:TweakLV.Items.Clear()
+    foreach ($t in Get-RegTweaks) {
+        $state = Get-TweakState -Tweak $t
+        $li = New-Object System.Windows.Forms.ListViewItem($t.Name)
+        $null = $li.SubItems.Add($state)
+        $null = $li.SubItems.Add($t.Desc)
+        $li.Tag = $t
+        switch ($state) {
+            'Applied'     { $li.ForeColor = Get-Color 'Green' }
+            'Already set' { $li.ForeColor = Get-Color 'SubText' }
+            default       { $li.ForeColor = Get-Color 'Text' }
+        }
+        $null = $script:TweakLV.Items.Add($li)
+    }
+    Set-Status 'Optimizations listed. Green = applied by this app (revertible). Tick and Apply or Revert.'
+}
+
+function Invoke-TweakRun {
+    param([bool]$Revert)
+    $checked = @($script:TweakLV.Items | Where-Object { $_.Checked })
+    if ($checked.Count -eq 0) { Set-Status 'Tick at least one optimization first.'; return }
+    $verb = if ($Revert) { 'Revert' } else { 'Apply' }
+    $names = ($checked | ForEach-Object { ' - ' + $_.Tag.Name }) -join "`n"
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        ("{0} these optimizations?`n`n{1}`n`nApply backs up the original values; Revert restores them exactly. Some take effect after sign-out or an Explorer restart." -f $verb, $names),
+        $script:AppName, 'YesNo', 'Question')
+    if ($answer -ne 'Yes') { return }
+    $done = 0
+    foreach ($li in $checked) {
+        Set-Status ("{0}: {1} ..." -f $verb, $li.Tag.Name)
+        $res = if ($Revert) { Invoke-TweakRevert -Tweak $li.Tag } else { Invoke-TweakApply -Tweak $li.Tag }
+        if ($res.Success) { $done++ } else {
+            [System.Windows.Forms.MessageBox]::Show(("'{0}': {1}" -f $li.Tag.Name, $res.Message), $script:AppName, 'OK', 'Warning') | Out-Null
+        }
+        $li.Checked = $false
+    }
+    Update-TweakList
+    Set-Status ("{0} complete for {1} optimization(s). Sign out or restart Explorer to see the full effect." -f $verb, $done)
 }
 
 # ----------------------------------------------------------------------------
-#  TAB 6: Performance
+#  PAGE 5: Performance
 # ----------------------------------------------------------------------------
 $tabPerf = New-Object System.Windows.Forms.TabPage
-$tabPerf.Text = ' Performance '
+$tabPerf.BackColor = Get-Color 'Bg'
 $null = $script:Tabs.TabPages.Add($tabPerf)
 
 $perfSplit = New-Object System.Windows.Forms.SplitContainer
 $perfSplit.Dock = 'Fill'
 $perfSplit.Orientation = 'Horizontal'
 
-$script:StartupLV = New-CheckedListView -Columns @('Startup entry', 'State', 'Source', 'Command') -Widths @(230, 80, 170, 600) -CheckBoxes $false
+$script:StartupLV = New-CheckedListView -Columns @('Startup entry', 'State', 'Source', 'Command') -Widths @(220, 80, 170, 580) -CheckBoxes $false
 $startupPanel = New-Object System.Windows.Forms.Panel
-$startupPanel.Dock = 'Top'
-$startupPanel.Height = 44
-$startupPanel.Controls.Add((New-Btn -Text 'Refresh startup list' -X 10 -Y 7 -OnClick { Update-StartupList }))
-$startupPanel.Controls.Add((New-Btn -Text 'Disable selected' -X 190 -Y 7 -W 140 -OnClick { Invoke-StartupToggle -Disable $true }))
-$startupPanel.Controls.Add((New-Btn -Text 'Enable selected' -X 340 -Y 7 -W 140 -OnClick { Invoke-StartupToggle -Disable $false }))
-$startupPanel.Controls.Add((New-Lbl -Text 'Disabling is fully reversible - entries are stored, not deleted. Leave security software (e.g. SecurityHealth) enabled.' -X 495 -Y 12 -W 640 -H 22))
-$perfSplit.Panel1.Controls.Add($script:StartupLV)
+$startupPanel.Dock = 'Top'; $startupPanel.Height = 86; $startupPanel.BackColor = Get-Color 'Bg'
+$startupPanel.Controls.Add((New-Lbl -Text 'Startup apps' -X 24 -Y 4 -W 140 -H 20 -Color 'Text' -Bold $true))
+$startupPanel.Controls.Add((New-Lbl -Text 'Disabling is fully reversible - entries are stored, not deleted. Red = security software, leave enabled.' -X 24 -Y 24 -W 800 -H 18))
+$startupPanel.Controls.Add((New-MatButton -Text 'Refresh' -X 24 -Y 46 -W 100 -H 32 -OnClick { Update-StartupList }))
+$startupPanel.Controls.Add((New-MatButton -Text 'Disable selected' -X 134 -Y 46 -W 145 -H 32 -OnClick { Invoke-StartupToggle -Disable $true }))
+$startupPanel.Controls.Add((New-MatButton -Text 'Enable selected' -X 289 -Y 46 -W 140 -H 32 -OnClick { Invoke-StartupToggle -Disable $false }))
+$perfSplit.Panel1.Controls.Add((New-LvCard -Inner $script:StartupLV))
 $perfSplit.Panel1.Controls.Add($startupPanel)
+$perfSplit.Panel1.BackColor = Get-Color 'Bg'
 
 $perfBottom = New-Object System.Windows.Forms.Panel
-$perfBottom.Dock = 'Fill'
-$perfBottom.Controls.Add((New-Lbl -Text 'Memory & agent hygiene' -X 10 -Y 8 -W 300 -H 20 -Bold $true))
-$script:MemLabel = New-Lbl -Text '' -X 320 -Y 10 -W 600 -H 20
+$perfBottom.Dock = 'Fill'; $perfBottom.BackColor = Get-Color 'Bg'
+$perfBottom.Controls.Add((New-Lbl -Text 'Memory & agent hygiene' -X 24 -Y 8 -W 220 -H 20 -Color 'Text' -Bold $true))
+$script:MemLabel = New-Lbl -Text '' -X 250 -Y 9 -W 500 -H 20
 $perfBottom.Controls.Add($script:MemLabel)
 
-$perfBottom.Controls.Add((New-Btn -Text 'Trim background memory' -X 10 -Y 34 -W 185 -OnClick {
+$perfBottom.Controls.Add((New-MatButton -Text 'Trim background memory' -X 24 -Y 32 -W 190 -Style 'Primary' -OnClick {
     Set-Status 'Trimming working sets of idle background processes (dev tools & agents are excluded)...'
     $before = Get-FreeMemoryMB
     $n = Invoke-MemoryTrim
@@ -1591,11 +2135,11 @@ $perfBottom.Controls.Add((New-Btn -Text 'Trim background memory' -X 10 -Y 34 -W 
     Update-MemLabel
     Set-Status ("Trimmed {0} background processes; ~{1:N0} MB returned to the free pool. Apps reload pages on demand - no harm done." -f $n, $gain)
 }))
-$perfBottom.Controls.Add((New-Btn -Text 'Flush DNS cache' -X 205 -Y 34 -W 140 -OnClick {
+$perfBottom.Controls.Add((New-MatButton -Text 'Flush DNS' -X 224 -Y 32 -W 110 -OnClick {
     try { Clear-DnsClientCache -ErrorAction Stop; Set-Status 'DNS cache flushed - fixes stale lookups that can stall agents and browsers.' }
     catch { & "$env:SystemRoot\System32\ipconfig.exe" /flushdns | Out-Null; Set-Status 'DNS cache flushed.' }
 }))
-$perfBottom.Controls.Add((New-Btn -Text 'Restart Explorer' -X 355 -Y 34 -W 140 -OnClick {
+$perfBottom.Controls.Add((New-MatButton -Text 'Restart Explorer' -X 344 -Y 32 -W 140 -OnClick {
     $answer = [System.Windows.Forms.MessageBox]::Show('Restart Windows Explorer? Your taskbar/desktop reload; open apps are unaffected.', $script:AppName, 'YesNo', 'Question')
     if ($answer -eq 'Yes') {
         Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
@@ -1604,30 +2148,31 @@ $perfBottom.Controls.Add((New-Btn -Text 'Restart Explorer' -X 355 -Y 34 -W 140 -
         Set-Status 'Explorer restarted.'
     }
 }))
-$perfBottom.Controls.Add((New-Btn -Text 'High Performance plan' -X 505 -Y 34 -W 165 -OnClick {
+$perfBottom.Controls.Add((New-MatButton -Text 'High Performance plan' -X 494 -Y 32 -W 175 -OnClick {
     & "$env:SystemRoot\System32\powercfg.exe" /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>&1 | Out-Null
     Set-Status 'High Performance power plan requested (on laptops this uses more battery).'
 }))
-$perfBottom.Controls.Add((New-Btn -Text 'Balanced plan' -X 680 -Y 34 -W 120 -OnClick {
+$perfBottom.Controls.Add((New-MatButton -Text 'Balanced plan' -X 679 -Y 32 -W 120 -OnClick {
     & "$env:SystemRoot\System32\powercfg.exe" /setactive 381b4222-f694-41f0-9685-ff5bb260df2e 2>&1 | Out-Null
     Set-Status 'Balanced power plan restored.'
 }))
 
-$perfBottom.Controls.Add((New-Lbl -Text 'Leftover agent processes (windowless node/python/build helpers whose parent app has exited - these hold memory and file locks that can trip up new agent runs):' -X 10 -Y 76 -W 1120 -H 20))
+$perfBottom.Controls.Add((New-Lbl -Text 'Leftover agent processes - windowless node/python/build helpers whose parent app exited. They hold memory and file locks that can trip up new agent runs.' -X 24 -Y 76 -W 1100 -H 18))
 $script:OrphanLV = New-CheckedListView -Columns @('PID', 'Process', 'Memory', 'Running since') -Widths @(80, 160, 100, 220)
-$script:OrphanLV.Dock = 'None'
-$script:OrphanLV.Location = New-Object System.Drawing.Point(10, 100)
-$script:OrphanLV.Size = New-Object System.Drawing.Size(700, 160)
-$script:OrphanLV.Anchor = 'Top,Left,Right,Bottom'
-$perfBottom.Controls.Add($script:OrphanLV)
-$perfBottom.Controls.Add((New-Btn -Text 'Scan for leftovers' -X 730 -Y 100 -W 160 -OnClick { Update-OrphanList }))
-$btnKillOrphans = New-Btn -Text 'End checked leftovers' -X 730 -Y 140 -W 160 -OnClick { Invoke-KillOrphans }
-$btnKillOrphans.Anchor = 'Top,Right'
-$perfBottom.Controls.Add($btnKillOrphans)
+$orphanFrame = New-Object System.Windows.Forms.Panel
+$orphanFrame.Location = New-Object System.Drawing.Point(24, 100)
+$orphanFrame.Size = New-Object System.Drawing.Size(700, 150)
+$orphanFrame.BackColor = Get-Color 'Border'
+$orphanFrame.Padding = New-Object System.Windows.Forms.Padding(1)
+$orphanFrame.Controls.Add($script:OrphanLV)
+$perfBottom.Controls.Add($orphanFrame)
+$perfBottom.Controls.Add((New-MatButton -Text 'Scan for leftovers' -X 744 -Y 100 -W 170 -OnClick { Update-OrphanList }))
+$perfBottom.Controls.Add((New-MatButton -Text 'End checked leftovers' -X 744 -Y 144 -W 170 -Style 'Danger' -OnClick { Invoke-KillOrphans }))
 
 $perfSplit.Panel2.Controls.Add($perfBottom)
 $tabPerf.Controls.Add($perfSplit)
-try { $perfSplit.SplitterDistance = 300 } catch { }
+$tabPerf.Controls.Add((New-PageHeader -Title 'Performance' -Subtitle 'Startup control, memory care and agent hygiene. Everything reversible, nothing critical touchable.'))
+try { $perfSplit.SplitterDistance = 280 } catch { }
 
 function Update-MemLabel {
     try {
@@ -1647,8 +2192,8 @@ function Update-StartupList {
         $null = $li.SubItems.Add($row.Source)
         $null = $li.SubItems.Add($row.Command)
         $li.Tag = $row
-        if (-not $row.Enabled) { $li.ForeColor = [System.Drawing.Color]::Gray }
-        if ($row.Name -match '(?i)security|defender|MsMpEng') { $li.ForeColor = [System.Drawing.Color]::Firebrick }
+        if (-not $row.Enabled) { $li.ForeColor = Get-Color 'SubText' }
+        if ($row.Name -match '(?i)security|defender|MsMpEng') { $li.ForeColor = Get-Color 'Red' }
         $null = $script:StartupLV.Items.Add($li)
     }
     Set-Status ("{0} startup entries. Red = security software, leave enabled. Select one, then Disable/Enable." -f $script:StartupLV.Items.Count)
@@ -1714,11 +2259,20 @@ function Invoke-KillOrphans {
 }
 
 # ============================================================================
-#  Launch
+#  Navigation + launch
 # ============================================================================
+Add-NavItem -Text 'Dashboard'      -GlyphCode 0xE80F -Index 0
+Add-NavItem -Text 'System Cleanup' -GlyphCode 0xE74D -Index 1
+Add-NavItem -Text 'AI Tools'       -GlyphCode 0xE99A -Index 2
+Add-NavItem -Text 'Move to G:'     -GlyphCode 0xE8DE -Index 3
+Add-NavItem -Text 'Registry'       -GlyphCode 0xE90F -Index 4
+Add-NavItem -Text 'Performance'    -GlyphCode 0xE945 -Index 5
+Select-Page -Index 0
+
 $script:Form.Add_Shown({
     Update-Dashboard
     Update-MemLabel
+    Update-TweakList
 })
 
 try {
